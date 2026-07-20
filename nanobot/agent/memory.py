@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from loguru import logger
 
-from nanobot.providers.transcription import GroqTranscriptionProvider
+from nanobot.services.transcription import TranscriptionService
 from nanobot.utils.helpers import (
     _extract_text,
     ensure_dir,
@@ -346,6 +346,7 @@ class MemoryConsolidator:
 
     _MAX_CONSOLIDATION_ROUNDS = 5
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
+    _transcription_service: TranscriptionService | None = None
 
     def __init__(
         self,
@@ -399,8 +400,10 @@ class MemoryConsolidator:
         ):
             return messages
 
-        provider = GroqTranscriptionProvider()
-        if not provider.api_key:
+        provider = TranscriptionService(
+            self.provider.generation.config
+        )  # Use global config from provider
+        if not provider.config.providers.groq.api_key:
             logger.warning(
                 "No transcription provider available; audio blocks will be stripped from memory"
             )

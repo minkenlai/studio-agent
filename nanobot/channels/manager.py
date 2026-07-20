@@ -43,8 +43,6 @@ class ChannelManager:
             load_channel_class,
         )
 
-        groq_key = self.config.providers.groq.api_key
-
         # 1. Gather all potential channel names (built-ins + plugins)
         # Built-ins take precedence if names collide.
         available_builtins = discover_channel_names()
@@ -76,7 +74,6 @@ class ChannelManager:
 
                 channel = cls(section, self.bus)
                 channel.global_config = self.config
-                channel.transcription_api_key = groq_key
                 self.channels[name] = channel
 
                 # Register aliases for enabled channel

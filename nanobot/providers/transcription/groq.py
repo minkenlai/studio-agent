@@ -1,17 +1,19 @@
 """Voice transcription provider using Groq."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
 import httpx
 from loguru import logger
 
+from .base import BaseTranscriptionProvider
 
-class GroqTranscriptionProvider:
+
+class GroqTranscriptionProvider(BaseTranscriptionProvider):
     """
     Voice transcription provider using Groq's Whisper API.
-
-    Groq offers extremely fast transcription with a generous free tier.
     """
 
     def __init__(self, api_key: str | None = None):
@@ -21,12 +23,6 @@ class GroqTranscriptionProvider:
     async def transcribe(self, file_path: str | Path) -> str:
         """
         Transcribe an audio file using Groq.
-
-        Args:
-            file_path: Path to the audio file.
-
-        Returns:
-            Transcribed text.
         """
         if not self.api_key:
             logger.warning("Groq API key not configured for transcription")

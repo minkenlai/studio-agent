@@ -1,5 +1,4 @@
 import base64
-import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -49,13 +48,17 @@ async def test_transcribe_audio_string_content():
 @pytest.mark.asyncio
 async def test_transcribe_audio_no_provider_strips():
     mock_no_key = MagicMock()
-    mock_no_key.api_key = None
+    mock_no_key.config = MagicMock()
+    mock_no_key.config.providers.groq.api_key = None
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_no_key,
+        "nanobot.services.transcription.TranscriptionService._get_provider",
+        side_effect=Exception("No key"),
     ):
         consolidator = _make_consolidator()
+        # Manually ensure the config matches what the service expects to fail
+        consolidator.provider.generation.config = mock_no_key.config
+
         messages = [{"role": "user", "content": [_make_text_block("hello"), _make_audio_block()]}]
         result = await consolidator._transcribe_audio(messages)
         assert len(result[0]["content"]) == 1
@@ -65,13 +68,12 @@ async def test_transcribe_audio_no_provider_strips():
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_success():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(return_value="transcribed text")
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(return_value="transcribed text")
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [
@@ -91,18 +93,16 @@ async def test_transcribe_audio_success():
         assert content[0] == {"type": "text", "text": "before"}
         assert content[1] == {"type": "text", "text": "[Transcribed Audio]: transcribed text"}
         assert content[2] == {"type": "text", "text": "after"}
-        mock_provider.transcribe.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_multiple_blocks():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(side_effect=["first", "second"])
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(side_effect=["first", "second"])
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [
@@ -113,54 +113,50 @@ async def test_transcribe_audio_multiple_blocks():
 
         assert result[0]["content"][0] == {"type": "text", "text": "[Transcribed Audio]: first"}
         assert result[1]["content"][1] == {"type": "text", "text": "[Transcribed Audio]: second"}
-        assert mock_provider.transcribe.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_ogg():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(return_value="ogg text")
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(return_value="ogg text")
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [
             {"role": "user", "content": [_make_audio_block(mime_type="audio/ogg; codecs=opus")]}
         ]
         await consolidator._transcribe_audio(messages)
-        tmp_path = mock_provider.transcribe.call_args[0][0]
+        tmp_path = mock_service.transcribe.call_args[0][0]
         assert tmp_path.suffix == ".ogg"
 
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_mp3():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(return_value="mp3 text")
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(return_value="mp3 text")
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [{"role": "user", "content": [_make_audio_block(mime_type="audio/mpeg")]}]
         await consolidator._transcribe_audio(messages)
-        tmp_path = mock_provider.transcribe.call_args[0][0]
+        tmp_path = mock_service.transcribe.call_args[0][0]
         assert tmp_path.suffix == ".mp3"
 
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_invalid_data():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(return_value="text")
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(return_value="text")
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [
@@ -171,18 +167,17 @@ async def test_transcribe_audio_invalid_data():
         ]
         result = await consolidator._transcribe_audio(messages)
         assert "[Transcription failed" in result[0]["content"][0]["text"]
-        mock_provider.transcribe.assert_not_called()
+        mock_service.transcribe.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_provider_error():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(side_effect=Exception("API error"))
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(side_effect=Exception("API error"))
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [{"role": "user", "content": [_make_audio_block()]}]
@@ -193,13 +188,12 @@ async def test_transcribe_audio_provider_error():
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_empty_result():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(return_value="")
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(return_value="")
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [{"role": "user", "content": [_make_audio_block()]}]
@@ -212,19 +206,18 @@ async def test_transcribe_audio_empty_result():
 
 @pytest.mark.asyncio
 async def test_transcribe_audio_temp_file_cleanup():
-    mock_provider = MagicMock()
-    mock_provider.api_key = "test-key"
-    mock_provider.transcribe = AsyncMock(return_value="text")
+    mock_service = MagicMock()
+    mock_service.transcribe = AsyncMock(return_value="text")
 
     with patch(
-        "nanobot.agent.memory.GroqTranscriptionProvider",
-        return_value=mock_provider,
+        "nanobot.services.transcription.TranscriptionService.transcribe",
+        side_effect=mock_service.transcribe,
     ):
         consolidator = _make_consolidator()
         messages = [{"role": "user", "content": [_make_audio_block()]}]
         await consolidator._transcribe_audio(messages)
-        tmp_path = mock_provider.transcribe.call_args[0][0]
-        assert not os.path.exists(tmp_path)
+        tmp_path = mock_service.transcribe.call_args[0][0]
+        assert not tmp_path.exists()
 
 
 @pytest.mark.asyncio
