@@ -214,37 +214,3 @@ def test_get_capabilities_prefix_longest_wins(tmp_path, mock_config):
         caps = get_capabilities("base-pro-v2")
         assert caps.audio is False
         assert caps.vision is True
-
-
-# ---------------------------------------------------------------------------
-# LLMClient.get_model_capabilities
-# ---------------------------------------------------------------------------
-
-
-def test_llm_client_get_model_capabilities(mock_config):
-    """LLMClient.get_model_capabilities should delegate to registry."""
-
-    class DummyClient:
-        """Minimal stub implementing just the method under test."""
-
-        def get_model_capabilities(self, model: str) -> ModelCapabilities:
-            from nanobot.providers.base import LLMClient
-
-            return LLMClient.get_model_capabilities(self, model)
-
-        def get_default_model(self) -> str:
-            return "test"
-
-        async def chat(self, *args, **kwargs):
-            pass
-
-    client = DummyClient()
-
-    with patch("nanobot.config.loader.load_config", return_value=mock_config):
-        caps = client.get_model_capabilities("gpt-4o")
-        assert caps.audio is True
-        assert caps.vision is True
-
-        fallback = client.get_model_capabilities("nonexistent")
-        assert fallback.audio is False
-        assert fallback.vision is False

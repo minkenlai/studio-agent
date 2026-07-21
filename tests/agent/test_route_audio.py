@@ -24,6 +24,13 @@ def _make_text_block(text: str) -> dict:
     return {"type": "text", "text": text}
 
 
+def _make_mock_provider(audio_support: bool = True) -> MagicMock:
+    """Create a mock provider with a `supports_native_audio` property."""
+    provider = MagicMock()
+    provider.supports_native_audio = audio_support
+    return provider
+
+
 def _make_message_with_audio(text: str = "Hello", num_audio: int = 1) -> dict:
     content = [_make_text_block(text)]
     for _ in range(num_audio):
@@ -41,9 +48,12 @@ class TestRouteAudioNativePassthrough:
 
         loop = MagicMock(spec=AgentLoop)
         loop._get_transcription_provider = AsyncMock()  # Should never be called
+        provider = _make_mock_provider(audio_support=True)
 
         messages = [_make_message_with_audio()]
-        result = await AgentLoop._route_audio(loop, messages, "claude-sonnet-4-20250514")
+        result = await AgentLoop._route_audio(
+            loop, messages, "claude-sonnet-4-20250514", provider=provider
+        )
 
         assert len(result) == 1
         assert len(result[0]["content"]) == 2
@@ -56,10 +66,13 @@ class TestRouteAudioNativePassthrough:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
+        provider = _make_mock_provider(audio_support=True)
         content = [_make_text_block("Hi"), _make_audio_block(), _make_text_block("Bye")]
         messages = [{"role": "user", "content": content}]
 
-        result = await AgentLoop._route_audio(loop, messages, "claude-sonnet-4-20250514")
+        result = await AgentLoop._route_audio(
+            loop, messages, "claude-sonnet-4-20250514", provider=provider
+        )
 
         assert len(result[0]["content"]) == 3
         assert result[0]["content"][0]["type"] == "text"
@@ -72,9 +85,12 @@ class TestRouteAudioNativePassthrough:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
+        provider = _make_mock_provider(audio_support=True)
         messages = [_make_message_with_audio("First"), _make_message_with_audio("Second")]
 
-        result = await AgentLoop._route_audio(loop, messages, "claude-sonnet-4-20250514")
+        result = await AgentLoop._route_audio(
+            loop, messages, "claude-sonnet-4-20250514", provider=provider
+        )
 
         assert len(result) == 2
         for msg in result:
@@ -91,12 +107,14 @@ class TestRouteAudioTranscription:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
-        provider = MagicMock()
-        provider.transcribe = AsyncMock(return_value="Hello, how are you?")
-        loop._get_transcription_provider = AsyncMock(return_value=provider)
+        mock_provider = _make_mock_provider(audio_support=False)
+        trans_provider = MagicMock()
+        trans_provider.transcribe = AsyncMock(return_value="Hello, how are you?")
+        loop._get_transcription_provider = AsyncMock(return_value=trans_provider)
+        loop._transcribe_audio_blocks = AgentLoop._transcribe_audio_blocks.__get__(loop, AgentLoop)
 
         messages = [_make_message_with_audio()]
-        result = await AgentLoop._route_audio(loop, messages, "gpt-4o")
+        result = await AgentLoop._route_audio(loop, messages, "gpt-4o", provider=mock_provider)
 
         assert len(result) == 1
         audio_blocks = [c for c in result[0]["content"] if c["type"] == "audio"]
@@ -105,7 +123,7 @@ class TestRouteAudioTranscription:
         transcribed = [t for t in text_blocks if t["text"].startswith("[Transcribed Audio]")]
         assert len(transcribed) == 1
         assert "Hello, how are you?" in transcribed[0]["text"]
-        provider.transcribe.assert_called_once()
+        trans_provider.transcribe.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("nanobot.providers.registry.get_capabilities", return_value=_make_mock_caps(audio=False))
@@ -113,14 +131,16 @@ class TestRouteAudioTranscription:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
-        provider = MagicMock()
-        provider.transcribe = AsyncMock(side_effect=["First audio", "Second audio"])
-        loop._get_transcription_provider = AsyncMock(return_value=provider)
+        mock_provider = _make_mock_provider(audio_support=False)
+        trans_provider = MagicMock()
+        trans_provider.transcribe = AsyncMock(side_effect=["First audio", "Second audio"])
+        loop._get_transcription_provider = AsyncMock(return_value=trans_provider)
+        loop._transcribe_audio_blocks = AgentLoop._transcribe_audio_blocks.__get__(loop, AgentLoop)
 
         messages = [_make_message_with_audio(num_audio=2)]
-        result = await AgentLoop._route_audio(loop, messages, "gpt-4o")
+        result = await AgentLoop._route_audio(loop, messages, "gpt-4o", provider=mock_provider)
 
-        assert provider.transcribe.await_count == 2
+        assert trans_provider.transcribe.await_count == 2
         text_blocks = [c for c in result[0]["content"] if c["type"] == "text"]
         transcribed = [t for t in text_blocks if t["text"].startswith("[Transcribed Audio]")]
         assert len(transcribed) == 2
@@ -133,17 +153,19 @@ class TestRouteAudioTranscription:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
-        provider = MagicMock()
-        provider.transcribe = AsyncMock(side_effect=["Msg1 audio", "Msg2 audio"])
-        loop._get_transcription_provider = AsyncMock(return_value=provider)
+        mock_provider = _make_mock_provider(audio_support=False)
+        trans_provider = MagicMock()
+        trans_provider.transcribe = AsyncMock(side_effect=["Msg1 audio", "Msg2 audio"])
+        loop._get_transcription_provider = AsyncMock(return_value=trans_provider)
+        loop._transcribe_audio_blocks = AgentLoop._transcribe_audio_blocks.__get__(loop, AgentLoop)
 
         messages = [
             _make_message_with_audio("Msg1"),
             _make_message_with_audio("Msg2"),
         ]
-        result = await AgentLoop._route_audio(loop, messages, "gpt-4o")
+        result = await AgentLoop._route_audio(loop, messages, "gpt-4o", provider=mock_provider)
 
-        assert provider.transcribe.await_count == 2
+        assert trans_provider.transcribe.await_count == 2
         assert len(result) == 2
 
     @pytest.mark.asyncio
@@ -152,12 +174,14 @@ class TestRouteAudioTranscription:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
-        provider = MagicMock()
-        provider.transcribe = AsyncMock(return_value="")
-        loop._get_transcription_provider = AsyncMock(return_value=provider)
+        mock_provider = _make_mock_provider(audio_support=False)
+        trans_provider = MagicMock()
+        trans_provider.transcribe = AsyncMock(return_value="")
+        loop._get_transcription_provider = AsyncMock(return_value=trans_provider)
+        loop._transcribe_audio_blocks = AgentLoop._transcribe_audio_blocks.__get__(loop, AgentLoop)
 
         messages = [_make_message_with_audio()]
-        result = await AgentLoop._route_audio(loop, messages, "gpt-4o")
+        result = await AgentLoop._route_audio(loop, messages, "gpt-4o", provider=mock_provider)
 
         audio_blocks = [c for c in result[0]["content"] if c["type"] == "audio"]
         assert len(audio_blocks) == 0
@@ -217,15 +241,17 @@ class TestRouteAudioEdgeCases:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
-        provider = MagicMock()
-        provider.transcribe = AsyncMock(return_value="Audio text")
-        loop._get_transcription_provider = AsyncMock(return_value=provider)
+        provider = _make_mock_provider(audio_support=False)
+        trans_provider = MagicMock()
+        trans_provider.transcribe = AsyncMock(return_value="Audio text")
+        loop._get_transcription_provider = AsyncMock(return_value=trans_provider)
+        loop._transcribe_audio_blocks = AgentLoop._transcribe_audio_blocks.__get__(loop, AgentLoop)
 
         messages = [
             {"role": "user", "content": [_make_text_block("Text only")]},
             _make_message_with_audio("With audio"),
         ]
-        result = await AgentLoop._route_audio(loop, messages, "gpt-4o")
+        result = await AgentLoop._route_audio(loop, messages, "gpt-4o", provider=provider)
 
         assert len(result) == 2
         # First message unchanged (no audio)
@@ -241,9 +267,11 @@ class TestRouteAudioEdgeCases:
         from nanobot.agent.loop import AgentLoop
 
         loop = MagicMock(spec=AgentLoop)
-        provider = MagicMock()
-        provider.transcribe = AsyncMock(return_value="Transcribed")
-        loop._get_transcription_provider = AsyncMock(return_value=provider)
+        provider = _make_mock_provider(audio_support=False)
+        trans_provider = MagicMock()
+        trans_provider.transcribe = AsyncMock(return_value="Transcribed")
+        loop._get_transcription_provider = AsyncMock(return_value=trans_provider)
+        loop._transcribe_audio_blocks = AgentLoop._transcribe_audio_blocks.__get__(loop, AgentLoop)
 
         msg = {
             "role": "user",
@@ -251,7 +279,7 @@ class TestRouteAudioEdgeCases:
             "name": "test_user",
             "metadata": {"key": "value"},
         }
-        result = await AgentLoop._route_audio(loop, [msg], "gpt-4o")
+        result = await AgentLoop._route_audio(loop, [msg], "gpt-4o", provider=provider)
 
         assert result[0]["role"] == "user"
         assert result[0]["name"] == "test_user"

@@ -233,6 +233,7 @@ class AgentLoop:
         self,
         messages: list[dict[str, Any]],
         model: str,
+        provider: LLMClient | None = None,
     ) -> list[dict[str, Any]]:
         """Route audio payloads based on the target model's capabilities.
 
@@ -248,32 +249,40 @@ class AgentLoop:
         if not has_audio_content(messages):
             return messages
 
-        caps = get_capabilities(model)
-        if caps.audio:
+        # If both the LLMClient and the model support native audio, then keep audio blocks
+        if provider and provider.supports_native_audio and get_capabilities(model).audio:
             logger.debug("Model '{}' natively supports audio — passing through", model)
             return messages
 
         # Transcription path
-        provider = await self._get_transcription_provider()
-        if provider is None:
+        trans_provider = await self._get_transcription_provider()
+        if trans_provider is None:
             logger.warning(
                 "Audio content detected but no transcription provider available; "
                 "replacing audio blocks with placeholders"
             )
             return LLMClient._strip_audio_content(messages) or messages
+        return await self._transcribe_audio_blocks(messages, model, trans_provider)
 
+    async def _transcribe_audio_blocks(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        trans_provider: GroqTranscriptionProvider,
+    ) -> list[dict[str, Any]]:
+        """Transcribe all audio blocks in *messages* via Groq Whisper."""
         import base64
         import tempfile
 
-        # Collect all audio blocks and their locations
-        audio_blocks: list[tuple[int, int, dict]] = []  # (msg_idx, block_idx, block)
-        for msg_idx, msg in enumerate(messages):
+        # Collect all audio blocks
+        audio_blocks: list[dict] = []
+        for msg in messages:
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
-            for block_idx, block in enumerate(content):
+            for block in content:
                 if isinstance(block, dict) and block.get("type") == "audio":
-                    audio_blocks.append((msg_idx, block_idx, block))
+                    audio_blocks.append(block)
 
         if not audio_blocks:
             return messages
@@ -314,7 +323,7 @@ class AgentLoop:
                 tmp_path = tmp.name
 
             try:
-                text = await provider.transcribe(tmp_path)
+                text = await trans_provider.transcribe(tmp_path)
                 if not text:
                     path = (block.get("_meta") or {}).get("path", "")
                     return f"[audio transcription failed: {path or 'unknown'}]"
@@ -329,7 +338,7 @@ class AgentLoop:
 
         # Transcribe all blocks concurrently
         transcribed_texts: list[str] = await asyncio.gather(
-            *[_transcribe_block(block) for _, _, block in audio_blocks]
+            *[_transcribe_block(block) for block in audio_blocks]
         )
 
         # Replace audio blocks in messages
@@ -651,7 +660,7 @@ class AgentLoop:
         # Conditional audio routing (Phase 2.2):
         # Intercept messages before the LLM call. If the target model supports
         # audio natively, pass through. Otherwise, transcribe audio blocks via Groq.
-        routed_messages = await self._route_audio(initial_messages, model)
+        routed_messages = await self._route_audio(initial_messages, model, provider=runner.provider)
 
         result = await runner.run(
             AgentRunSpec(

@@ -415,13 +415,13 @@ def get_capabilities(model_id: str) -> "ModelCapabilities":
     config = load_config()
     caps = config.capabilities
 
-    # Exact match
+    # 1. Exact match in config (override)
     if normalized in caps:
-        return caps[normalized]
+        model_caps = caps[normalized]
+    # 2. Prefix match in config (override): "gemma4-12b-it-qat" → "gemma4-12b"
+    elif best := max((key for key in caps if normalized.startswith(key)), key=len, default=None):
+        model_caps = caps[best]
+    else:
+        model_caps = ModelCapabilities()
 
-    # Prefix match (longest wins): "gemma4-12b-it-qat" → "gemma4-12b"
-    best = max((key for key in caps if normalized.startswith(key)), key=len, default=None)
-    if best is not None:
-        return caps[best]
-
-    return ModelCapabilities()
+    return model_caps

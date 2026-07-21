@@ -513,9 +513,3 @@ class LLMClient(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
-
-    def get_model_capabilities(self, model: str) -> ModelCapabilities:
-        """Resolve the capabilities for *model* from the active config."""
-        from .registry import get_capabilities
-
-        return get_capabilities(model)
