@@ -148,6 +148,11 @@ class LLMClient(ABC):
         except Exception as e:
             logger.warning("Failed to dump LLM debug data: {}", e)
 
+    @property
+    def supports_native_audio(self):
+        spec = getattr(self, "_spec", None)
+        return spec and getattr(spec, "supports_native_audio", False)
+
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sanitize message content: fix empty blocks, strip internal _meta fields."""

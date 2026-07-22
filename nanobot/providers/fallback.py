@@ -413,6 +413,11 @@ class FallbackClient(LLMClient):
     # ------------------------------------------------------------------
 
     @property
+    def active_provider(self) -> str:
+        """The LLMClient of the currently active slot."""
+        return self._slots[self._active_index][0]
+
+    @property
     def active_model(self) -> str:
         """The model string of the currently active slot."""
         return self._slots[self._active_index][1]
@@ -426,6 +431,10 @@ class FallbackClient(LLMClient):
     def fallback_identifiers(self) -> list[str]:
         """The config identifiers of all slots in the chain."""
         return [s[2] for s in self._slots]
+
+    @property
+    def supports_native_audio(self):
+        return self.active_provider.supports_native_audio
 
     def _check_reset(self) -> str | None:
         """Return a reset notification if the quota window has rolled over, else None."""
