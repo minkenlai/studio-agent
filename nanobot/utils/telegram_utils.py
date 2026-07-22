@@ -1,7 +1,7 @@
 """
 Utility functions for persisting Telegram topic profile mappings.
 
-Schema: {chat_id: {topic_id: {"profile": str|null, "name": str|null}}}
+Schema: {chat_id: {topic_id: {"profile": str|null, "name": str|null, "native_audio": bool|null}}}
 """
 
 import json
@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 PINS_FILE = Path("sessions/tg_pins.json")
 
-# Type alias: {chat_id_str: {topic_id_int: {"profile": str|None, "name": str|None}}}
+# Type alias: {chat_id_str: {topic_id_int: {"profile": str|None, "name": str|None, "native_audio": bool|None}}}
 TopicPinEntry = Dict[str, Any]
 
 
@@ -18,7 +18,7 @@ def load_topic_pins() -> Dict[str, Dict[int, TopicPinEntry]]:
     """Load the topic profile mappings from the JSON file.
 
     Returns:
-        Nested dict {chat_id: {topic_id: {"profile": ..., "name": ...}}}
+        Nested dict {chat_id: {topic_id: {"profile": ..., "name": ..., "native_audio": ...}}}
     """
     if not PINS_FILE.exists():
         return {}
@@ -35,14 +35,19 @@ def load_topic_pins() -> Dict[str, Dict[int, TopicPinEntry]]:
             for topic_id_str, value in topics.items():
                 topic_id = int(topic_id_str)
                 if isinstance(value, dict):
-                    # New format: {"profile": ..., "name": ...}
+                    # New format: {"profile": ..., "name": ..., "native_audio": ...}
                     result[chat_id][topic_id] = {
                         "profile": value.get("profile"),
                         "name": value.get("name"),
+                        "native_audio": value.get("native_audio"),
                     }
                 else:
                     # Legacy flat format: just the profile string (or null)
-                    result[chat_id][topic_id] = {"profile": value, "name": None}
+                    result[chat_id][topic_id] = {
+                        "profile": value,
+                        "name": None,
+                        "native_audio": None,
+                    }
 
         return result
     except (json.JSONDecodeError, ValueError) as e:
@@ -89,6 +94,7 @@ def set_cached_profile(
     topic_id: int,
     profile: Optional[str],
     topic_name: Optional[str] = None,
+    native_audio: Optional[bool] = None,
 ) -> None:
     """Set the cached profile for a chat/topic in the in-memory pins dict."""
     if chat_id not in pins:
@@ -100,6 +106,10 @@ def set_cached_profile(
         pins[chat_id][topic_id]["name"] = topic_name
     elif "name" not in pins[chat_id][topic_id]:
         pins[chat_id][topic_id]["name"] = None
+    if native_audio is not None:
+        pins[chat_id][topic_id]["native_audio"] = native_audio
+    elif "native_audio" not in pins[chat_id][topic_id]:
+        pins[chat_id][topic_id]["native_audio"] = None
 
 
 def set_cached_topic_name(
@@ -133,4 +143,4 @@ def add_lazy_topic_entry(
     if chat_id not in pins:
         pins[chat_id] = {}
     if topic_id not in pins[chat_id]:
-        pins[chat_id][topic_id] = {"profile": None, "name": None}
+        pins[chat_id][topic_id] = {"profile": None, "name": None, "native_audio": None}

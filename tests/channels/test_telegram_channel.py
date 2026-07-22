@@ -1100,11 +1100,11 @@ async def test_send_delta_stream_end_stops_typing_by_chat_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_topic_lazy_fill_creates_3_tuple() -> None:
-    """Lazy-fill of _topic_pins for a new topic must create a 3-tuple.
+async def test_topic_lazy_fill_creates_4_tuple() -> None:
+    """Lazy-fill of _topic_pins for a new topic must create a 4-tuple.
 
     Regression: a 2-tuple (None, None) caused 'not enough values to unpack'
-    when _get_topic_profile_pin or _on_forum_topic_created tried to unpack 3 values.
+    when _get_topic_profile_pin or _on_forum_topic_created tried to unpack 4 values.
     """
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
@@ -1137,11 +1137,12 @@ async def test_topic_lazy_fill_creates_3_tuple() -> None:
 
     await channel._forward_command(update, None)
 
-    # The lazy-fill should have created a 3-tuple.
+    # The lazy-fill should have created a 4-tuple.
     assert cache_key in channel._topic_pins
     entry = channel._topic_pins[cache_key]
-    assert len(entry) == 3, f"Expected 3-tuple, got {len(entry)}-tuple: {entry}"
+    assert len(entry) == 4, f"Expected 4-tuple, got {len(entry)}-tuple: {entry}"
 
     # Verify unpacking works (this is what _get_topic_profile_pin does).
-    _, profile, _ = entry
+    _, profile, _, native_audio = entry
     assert profile is None
+    assert native_audio is None

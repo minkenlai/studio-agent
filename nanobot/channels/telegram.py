@@ -245,8 +245,8 @@ class TelegramChannel(BaseChannel):
         self._progress_message_id: dict[str, int] = {}  # address_uri -> status message id
         self._progress_history: dict[str, list[str]] = {}  # address_uri -> audit trail
         self._topic_pins: dict[
-            str, tuple[int | None, str | None, str | None]
-        ] = {}  # chat_id:thread_id -> (pinned_message_id, profile_name, topic_name)
+            str, tuple[int | None, str | None, str | None, bool | None]
+        ] = {}  # chat_id:thread_id -> (pinned_message_id, profile_name, topic_name, native_audio)
 
         # Initialize pins from disk
         persistence = load_topic_pins()
@@ -254,7 +254,13 @@ class TelegramChannel(BaseChannel):
             for thread_id, entry in topics.items():
                 profile = entry.get("profile") if isinstance(entry, dict) else entry
                 topic_name = entry.get("name") if isinstance(entry, dict) else None
-                self._topic_pins[f"{chat_id}:{thread_id}"] = (None, profile, topic_name)
+                native_audio = entry.get("native_audio") if isinstance(entry, dict) else None
+                self._topic_pins[f"{chat_id}:{thread_id}"] = (
+                    None,
+                    profile,
+                    topic_name,
+                    native_audio,
+                )
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -950,17 +956,18 @@ class TelegramChannel(BaseChannel):
             if key.startswith(f"{chat_id}:"):
                 found = True
                 _, topic_id_str = key.split(":", 1)
-                _, profile, topic_name = value
-                topics_to_show.append((int(topic_id_str), profile, topic_name))
+                _, profile, topic_name, native_audio = value
+                topics_to_show.append((int(topic_id_str), profile, topic_name, native_audio))
 
         topics_to_show.sort()
 
-        for topic_id, profile, topic_name in topics_to_show:
+        for topic_id, profile, topic_name, native_audio in topics_to_show:
             profile_str = f"`{profile}`" if profile else "_(none)_"
+            audio_str = " 🔊" if native_audio else (" 🔇" if native_audio is False else "")
             if topic_name:
-                lines.append(f'• Topic {topic_id} "{topic_name}" = {profile_str}')
+                lines.append(f'• Topic {topic_id} "{topic_name}" = {profile_str}{audio_str}')
             else:
-                lines.append(f"• Topic {topic_id}: {profile_str}")
+                lines.append(f"• Topic {topic_id}: {profile_str}{audio_str}")
 
         if not found:
             lines.append("No topics discovered yet in this chat.")
@@ -968,7 +975,7 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def _on_pin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /pin <profile> command."""
+        """Handle /pin <profile> [flags] command."""
         if not update.message:
             return
 
@@ -986,10 +993,18 @@ class TelegramChannel(BaseChannel):
 
         args = context.args
         if not args:
-            await update.message.reply_text("Usage: `/pin <profile_name>`", parse_mode="Markdown")
+            await update.message.reply_text(
+                "Usage: `/pin <profile_name> [--native-audio | --no-native-audio]`",
+                parse_mode="Markdown",
+            )
             return
 
         profile_name = args[0].lower()
+        native_audio = None
+        if "--native-audio" in args:
+            native_audio = True
+        elif "--no-native-audio" in args:
+            native_audio = False
 
         # Validate profile name
         valid = False
@@ -1013,17 +1028,27 @@ class TelegramChannel(BaseChannel):
         cache_key = f"{chat_id_str}:{thread_id}"
 
         # Update in-memory
-        _, _, topic_name = self._topic_pins.get(cache_key, (None, None, None))
-        self._topic_pins[cache_key] = (None, profile_name, topic_name)
+        _, _, topic_name, existing_native = self._topic_pins.get(
+            cache_key, (None, None, None, None)
+        )
+        self._topic_pins[cache_key] = (
+            None,
+            profile_name,
+            topic_name,
+            native_audio if native_audio is not None else existing_native,
+        )
 
         # Save to disk
         persistence = load_topic_pins()
-        set_cached_profile(persistence, chat_id_str, thread_id, profile_name, topic_name)
+        set_cached_profile(
+            persistence, chat_id_str, thread_id, profile_name, topic_name, native_audio=native_audio
+        )
         save_topic_pins(persistence)
 
-        await update.message.reply_text(
-            f"✅ Topic {thread_id} pinned to profile: `{profile_name}`", parse_mode="Markdown"
-        )
+        msg_text = f"✅ Topic {thread_id} pinned to profile: `{profile_name}`"
+        if native_audio is not None:
+            msg_text += f" (Native Audio: {'Enabled' if native_audio else 'Disabled'})"
+        await update.message.reply_text(msg_text, parse_mode="Markdown")
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -1031,17 +1056,13 @@ class TelegramChannel(BaseChannel):
         sid = str(user.id)
         return f"{sid}|{user.username}" if user.username else sid
 
-    @staticmethod
-    def _sender_id(user) -> str:
-        """Build sender_id with username for allowlist matching."""
-        sid = str(user.id)
-        return f"{sid}|{user.username}" if user.username else sid
-
-    async def _get_topic_profile_pin(self, chat_id: int, thread_id: int) -> str | None:
-        """Return the cached profile for a forum topic."""
+    async def _get_topic_profile_pin(
+        self, chat_id: int, thread_id: int
+    ) -> tuple[str | None, bool | None]:
+        """Return the cached profile and native_audio flag for a forum topic."""
         cache_key = f"{chat_id}:{thread_id}"
-        _, profile, _ = self._topic_pins.get(cache_key, (None, None, None))
-        return profile
+        entry = self._topic_pins.get(cache_key, (None, None, None, None))
+        return entry[1], entry[3]
 
     async def _on_forum_topic_created(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1056,13 +1077,14 @@ class TelegramChannel(BaseChannel):
             return
         topic_name = getattr(topic, "name", None)
         cache_key = f"{msg.chat_id}:{thread_id}"
-        cached_pid, cached_profile, cached_name = self._topic_pins.get(
-            cache_key, (None, None, None)
+        cached_pid, cached_profile, cached_name, cached_native = self._topic_pins.get(
+            cache_key, (None, None, None, None)
         )
         self._topic_pins[cache_key] = (
             cached_pid,
             cached_profile,
             topic_name or cached_name,
+            cached_native,
         )
         logger.info(
             "Forum topic created: key {} topic {} name={}", cache_key, thread_id, topic_name
@@ -1087,13 +1109,14 @@ class TelegramChannel(BaseChannel):
             return
         topic_name = getattr(topic_edit, "name", None)
         cache_key = f"{msg.chat_id}:{thread_id}"
-        cached_pid, cached_profile, cached_name = self._topic_pins.get(
-            cache_key, (None, None, None)
+        cached_pid, cached_profile, cached_name, cached_native = self._topic_pins.get(
+            cache_key, (None, None, None, None)
         )
         self._topic_pins[cache_key] = (
             cached_pid,
             cached_profile,
             topic_name or cached_name,
+            cached_native,
         )
         logger.info("Forum topic edited: key {} topic {} name={}", cache_key, thread_id, topic_name)
         # Persist to disk
@@ -1138,9 +1161,13 @@ class TelegramChannel(BaseChannel):
         return f"[Reply to: {text}]" if text else None
 
     async def _download_message_media(
-        self, msg, *, add_failure_content: bool = False
+        self, msg, *, add_failure_content: bool = False, native_audio: bool | None = None
     ) -> tuple[list[str], list[str]]:
-        """Download media from a message (current or reply). Returns (media_paths, content_parts)."""
+        """Download media from a message (current or reply). Returns (media_paths, content_parts).
+
+        When native_audio is True, voice/audio files are passed as-is without transcription.
+        When native_audio is False or None, audio is transcribed and only text is returned.
+        """
         media_file = None
         media_type = None
         if getattr(msg, "photo", None):
@@ -1179,11 +1206,14 @@ class TelegramChannel(BaseChannel):
             await file.download_to_drive(str(file_path))
             path_str = str(file_path)
             if media_type in ("voice", "audio"):
+                if native_audio:
+                    logger.info("Passing raw {} file: {}", media_type, path_str)
+                    return [path_str], []
                 transcription = await self.transcribe_audio(file_path)
                 if transcription:
                     logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                    return [path_str], [f"[transcription: {transcription}]"]
-                return [path_str], [f"[{media_type}: {path_str}]"]
+                    return [], [f"[transcription: {transcription}]"]
+                return [], [f"[{media_type}: {path_str}]"]
             return [path_str], [f"[{media_type}: {path_str}]"]
         except Exception as e:
             logger.warning("Failed to download message media: {}", e)
@@ -1280,7 +1310,7 @@ class TelegramChannel(BaseChannel):
             # Lazy-fill topic mapping
             cache_key = f"{message.chat_id}:{thread_id}"
             if cache_key not in self._topic_pins:
-                self._topic_pins[cache_key] = (None, None, None)
+                self._topic_pins[cache_key] = (None, None, None, None)
                 # Note: we don't save to disk on lazy-fill to avoid excessive writes
                 # but it will appear in /topics for the current session.
 
@@ -1328,9 +1358,24 @@ class TelegramChannel(BaseChannel):
         if message.caption:
             content_parts.append(message.caption)
 
+        # Fetch topic pin early for native_audio awareness
+        str_chat_id = str(chat_id)
+        thread_id = getattr(message, "message_thread_id", None)
+        native_audio: bool | None = None
+        pin_profile: str | None = None
+        if thread_id is not None:
+            cache_key = f"{str_chat_id}:{thread_id}"
+            if cache_key not in self._topic_pins:
+                self._topic_pins[cache_key] = (None, None, None, None)
+            pin_profile, pin_native_audio = await self._get_topic_profile_pin(chat_id, thread_id)
+            native_audio = pin_native_audio
+            if pin_profile:
+                # Will be set in metadata below
+                pass
+
         # Download current message media
         current_media_paths, current_media_parts = await self._download_message_media(
-            message, add_failure_content=True
+            message, add_failure_content=True, native_audio=native_audio
         )
         media_paths.extend(current_media_paths)
         content_parts.extend(current_media_parts)
@@ -1341,7 +1386,9 @@ class TelegramChannel(BaseChannel):
         reply = getattr(message, "reply_to_message", None)
         if reply is not None:
             reply_ctx = self._extract_reply_context(message)
-            reply_media, reply_media_parts = await self._download_message_media(reply)
+            reply_media, reply_media_parts = await self._download_message_media(
+                reply, native_audio=native_audio
+            )
             if reply_media:
                 media_paths = reply_media + media_paths
                 logger.debug("Attached replied-to media: {}", reply_media[0])
@@ -1354,19 +1401,9 @@ class TelegramChannel(BaseChannel):
 
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
-        str_chat_id = str(chat_id)
         metadata = self._build_message_metadata(message, user)
-
-        # Profile pinning support for forum topics
-        if (thread_id := getattr(message, "message_thread_id", None)) is not None:
-            # Lazy-fill topic mapping
-            cache_key = f"{chat_id}:{thread_id}"
-            if cache_key not in self._topic_pins:
-                self._topic_pins[cache_key] = (None, None, None)
-
-            profile = await self._get_topic_profile_pin(chat_id, thread_id)
-            if profile:
-                metadata["agent_profile"] = profile
+        if pin_profile:
+            metadata["agent_profile"] = pin_profile
 
         # Create the unified address
         segments = [str_chat_id]

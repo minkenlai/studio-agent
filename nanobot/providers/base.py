@@ -421,13 +421,15 @@ class LLMClient(ABC):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning(
-                        "Non-transient LLM error with image content, retrying without images"
+                        "Non-transient LLM error with image content, retrying without images: {}",
+                        (response.content or "")[:120],
                     )
                     return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 stripped_audio = self._strip_audio_content(messages)
                 if stripped_audio is not None:
                     logger.warning(
-                        "Non-transient LLM error with audio content, retrying without audio"
+                        "Non-transient LLM error with audio content, retrying without audio: {}",
+                        (response.content or "")[:120],
                     )
                     return await self._safe_chat_stream(**{**kw, "messages": stripped_audio})
                 return response
@@ -492,13 +494,15 @@ class LLMClient(ABC):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning(
-                        "Non-transient LLM error with image content, retrying without images"
+                        "Non-transient LLM error with image content, retrying without images: {}",
+                        (response.content or "")[:120],
                     )
                     return await self._safe_chat(**{**kw, "messages": stripped})
                 stripped_audio = self._strip_audio_content(messages)
                 if stripped_audio is not None:
                     logger.warning(
-                        "Non-transient LLM error with audio content, retrying without audio"
+                        "Non-transient LLM error with audio content, retrying without audio: {}",
+                        (response.content or "")[:120],
                     )
                     return await self._safe_chat(**{**kw, "messages": stripped_audio})
                 return response
