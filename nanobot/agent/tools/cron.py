@@ -232,7 +232,8 @@ class CronTool(Tool):
         lines = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
-            parts = [f"- {j.name} (id: {j.id}, {timing})"]
+            stateless_flag = " [stateless]" if j.stateless else ""
+            parts = [f"- {j.name} (id: {j.id}, {timing}{stateless_flag})"]
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)

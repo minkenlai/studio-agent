@@ -299,6 +299,30 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
     assert result == "No scheduled jobs."
 
 
+def test_list_shows_stateless_flag(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Stateless job",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
+        message="test",
+        stateless=True,
+    )
+    result = tool._list_jobs()
+    assert "[stateless]" in result
+
+
+def test_list_does_not_show_stateless_flag_by_default(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Stateful job",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
+        message="test",
+        stateless=False,
+    )
+    result = tool._list_jobs()
+    assert "[stateless]" not in result
+
+
 def test_set_context_with_address(tmp_path) -> None:
     from nanobot.bus.events import Address
 
