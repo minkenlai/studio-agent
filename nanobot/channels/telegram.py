@@ -1314,7 +1314,7 @@ class TelegramChannel(BaseChannel):
                 # Note: we don't save to disk on lazy-fill to avoid excessive writes
                 # but it will appear in /topics for the current session.
 
-            profile = await self._get_topic_profile_pin(message.chat_id, thread_id)
+            profile, _ = await self._get_topic_profile_pin(message.chat_id, thread_id)
             if profile:
                 metadata["agent_profile"] = profile
 
