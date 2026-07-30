@@ -26,3 +26,5 @@ nano.*.save
 uv.lock
 logs/
 .opencode/
+*.wav
+third_party/

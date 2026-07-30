@@ -101,12 +101,30 @@ class ReplConfig(Base):
 
 
 class ProviderConfig(Base):
-    """LLM provider configuration."""
+    """Configuration for an LLM provider endpoint."""
 
     api_key: str = ""
     quota_reset_timezone: str = "UTC"
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+
+
+class ChatterboxTTSConfig(BaseModel):
+    model_variant: str = "nano"  # "nano" or "turbo"
+    device: str = "cpu"  # "cpu" or "cuda"
+    audio_prompt_path: str | None = None  # optional voice cloning ref
+
+
+class OpenAITTSConfig(BaseModel):
+    api_key: str | None = None
+    api_base: str | None = None
+    default_voice: str = "alloy"
+
+
+class TTSConfig(BaseModel):
+    provider: str = "chatterbox"  # "chatterbox" or "openai"
+    chatterbox: ChatterboxTTSConfig = Field(default_factory=ChatterboxTTSConfig)
+    openai: OpenAITTSConfig = Field(default_factory=OpenAITTSConfig)
 
 
 class ProvidersConfig(Base):
@@ -262,6 +280,7 @@ class Config(BaseSettings):
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     repl: ReplConfig = Field(default_factory=ReplConfig)
