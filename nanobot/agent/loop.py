@@ -150,6 +150,10 @@ class AgentLoop:
         self._transcription_provider: GroqTranscriptionProvider | None = None
         self._transcription_provider_lock = asyncio.Lock()
 
+        # Lazy TTS client
+        self._tts_client = None
+        self._tts_client_lock = asyncio.Lock()
+
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider or self.runner.provider,
@@ -228,6 +232,28 @@ class AgentLoop:
                 self._transcription_provider = GroqTranscriptionProvider(api_key=None)
 
         return self._transcription_provider
+
+    async def get_tts_client(self):
+        """Lazily initialize the TTS client from config."""
+        if self._tts_client is not None:
+            return self._tts_client
+
+        async with self._tts_client_lock:
+            if self._tts_client is not None:
+                return self._tts_client
+
+            from nanobot.providers.tts import make_tts_provider
+
+            if self.config and self.config.tts:
+                try:
+                    self._tts_client = make_tts_provider(self.config.tts)
+                    logger.info("TTS client initialized (provider={})", self.config.tts.provider)
+                except Exception as e:
+                    logger.warning("Failed to initialize TTS client: {}", e)
+            else:
+                logger.warning("No TTS configuration found")
+
+        return self._tts_client
 
     async def _route_audio(
         self,

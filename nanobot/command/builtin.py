@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import traceback
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -85,6 +87,78 @@ async def cmd_fallback(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_speak(ctx: CommandContext) -> OutboundMessage:
+    """Synthesize text to speech.
+
+    Usage:
+      /speak "Hello world"   — synthesize the given text
+      /speak                 — synthesize the last agent message from session
+    """
+    from nanobot.config.paths import get_media_dir
+
+    msg = ctx.msg
+    loop = ctx.loop
+
+    if loop is None:
+        return OutboundMessage(address=msg.address, content="Error: agent loop not available.")
+
+    # Get TTS client
+    tts = await loop.get_tts_client()
+    if tts is None:
+        return OutboundMessage(
+            address=msg.address,
+            content="🔇 TTS is not configured. Check `tts.provider` in config.",
+        )
+
+    # Determine text to speak
+    text = ctx.args.strip()
+    if not text:
+        # Grab last assistant message from session
+        session = ctx.session or loop.sessions.get_or_create(ctx.key)
+        last_asst = ""
+        for m in reversed(session.messages):
+            if m.get("role") == "assistant":
+                last_asst = m.get("content", "")
+                break
+        if not last_asst:
+            return OutboundMessage(
+                address=msg.address,
+                content="No prior agent message found to speak.",
+            )
+        text = last_asst
+
+    # Strip markdown for cleaner TTS
+    clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    clean = re.sub(r"`([^`]+)`", r"\1", clean)
+    clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", clean)
+    clean = re.sub(r"^#{1,6}\s+", "", clean, flags=re.MULTILINE)
+    clean = re.sub(r"\n{2,}", "\n", clean)
+    clean = clean.strip()
+
+    if not clean:
+        return OutboundMessage(
+            address=msg.address, content="Nothing to speak (empty after cleanup)."
+        )
+
+    # Generate audio file
+    out_dir = get_media_dir(msg.address.channel)
+    filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
+    out_path = out_dir / filename
+
+    ok = await tts.synthesize(clean, out_path)
+    if not ok:
+        return OutboundMessage(
+            address=msg.address,
+            content="🔇 TTS synthesis failed. Check logs for details.",
+        )
+
+    return OutboundMessage(
+        address=msg.address,
+        content="",
+        media=[str(out_path)],
+    )
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Show help for builtin commands."""
     msg = ctx.msg
@@ -97,6 +171,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     content += "- `/tasks`: List current and recent background tasks\n"
     content += "- `/usage`: Show token usage for the current session\n"
     content += "- `/stop`: Cancel all active tasks in this session\n"
+    content += "- `/speak [msg]`: Synthesize text to speech (no args = speak last agent message)\n"
     content += "- `/repl`: Execute Python code in the current environment\n"
     content += "- `/restart`: Refresh code in-place (preserves PID)\n"
     content += "- `/restart --full`: Graceful full reboot (requires systemd)\n"
@@ -541,6 +616,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/help", cmd_help)
     router.exact("/status", cmd_status)
     router.exact("/fallback", cmd_fallback)
+    router.exact("/speak", cmd_speak)
     router.priority("/stop", cmd_stop)
     router.priority("/repl", cmd_repl)
     router.priority("/restart", cmd_restart)
