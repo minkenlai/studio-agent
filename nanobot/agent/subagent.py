@@ -17,6 +17,7 @@ from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import Address, InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -90,6 +91,7 @@ class SubagentManager:
         session_key: str | None = None,
         context_scope: Literal["full", "technical", "minimal"] = "full",
         included_skills: list[str] | None = None,
+        agent_profile: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -120,6 +122,7 @@ class SubagentManager:
                 context_scope,
                 included_skills,
                 gate=gate,
+                agent_profile=agent_profile,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -150,6 +153,7 @@ class SubagentManager:
         context_scope: Literal["full", "technical", "minimal"] = "full",
         included_skills: list[str] | None = None,
         gate: asyncio.Event | None = None,
+        agent_profile: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         if gate:
@@ -175,6 +179,7 @@ class SubagentManager:
                     f"Error: Failed to initialize agent '{agent_name}': {e}",
                     origin,
                     "error",
+                    agent_profile=agent_profile,
                 )
                 return
 
@@ -230,6 +235,9 @@ class SubagentManager:
             )
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
+            # If the subagent itself needs to spawn other subagents (recursion),
+            # it can use the spawn tool, but it must pass its own agent_profile.
+            tools.register(SpawnTool(manager=self, agent_profile=agent_profile))
 
             system_prompt = self._build_subagent_prompt(context_scope, included_skills)
             messages: list[dict[str, Any]] = [
@@ -282,6 +290,7 @@ class SubagentManager:
                     formatted_partial,
                     origin,
                     "error",
+                    agent_profile=agent_profile,
                 )
                 return
             if result.stop_reason == "error":
@@ -294,6 +303,7 @@ class SubagentManager:
                     err,
                     origin,
                     "error",
+                    agent_profile=agent_profile,
                 )
                 return
 
@@ -303,13 +313,17 @@ class SubagentManager:
 
             _log_to_file(f"🏁 DONE: {final_result}\n")
             logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+            await self._announce_result(
+                task_id, label, task, final_result, origin, "ok", agent_profile=agent_profile
+            )
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             _log_to_file(f"💥 CRASH: {error_msg}\n")
             logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, error_msg, origin, "error")
+            await self._announce_result(
+                task_id, label, task, error_msg, origin, "error", agent_profile=agent_profile
+            )
 
     async def _announce_result(
         self,
@@ -319,6 +333,7 @@ class SubagentManager:
         result: str,
         origin: Address,
         status: str,
+        agent_profile: str | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         # Update registry with final status
@@ -355,6 +370,7 @@ Result:
             address=origin,
             sender_id="subagent",
             content=announce_content,
+            metadata={"agent_profile": agent_profile} if agent_profile else {},
         )
 
         await self.bus.publish_inbound(msg)

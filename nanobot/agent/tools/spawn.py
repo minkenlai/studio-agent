@@ -12,15 +12,24 @@ if TYPE_CHECKING:
 class SpawnTool(Tool):
     """Tool to spawn a subagent for background task execution."""
 
-    def __init__(self, manager: "SubagentManager"):
+    def __init__(
+        self,
+        manager: "SubagentManager",
+        agent_profile: str | None = None,
+    ):
         self._manager = manager
         self._origin = Address(channel="cli", segments=("direct",))
         self._session_key = "cli:direct"
+        self._agent_profile = agent_profile
 
     def set_context(self, address: Address, session_key: str) -> None:
         """Set the origin context for subagent announcements."""
         self._origin = address
         self._session_key = session_key
+
+    def set_agent_profile(self, profile: str | None) -> None:
+        """Set the agent profile to propagate when subagents report results."""
+        self._agent_profile = profile
 
     @property
     def name(self) -> str:
@@ -123,4 +132,5 @@ class SpawnTool(Tool):
             session_key=self._session_key,
             context_scope=context_scope,
             included_skills=included_skills,
+            agent_profile=self._agent_profile,
         )

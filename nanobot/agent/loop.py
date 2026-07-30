@@ -447,7 +447,11 @@ class AgentLoop:
             self._mcp_connecting = False
 
     def _set_tool_context(
-        self, address: Address, session_key: str, message_id: str | None = None
+        self,
+        address: Address,
+        session_key: str,
+        message_id: str | None = None,
+        agent_profile: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -455,6 +459,11 @@ class AgentLoop:
                 if hasattr(tool, "set_context"):
                     if name == "message":
                         tool.set_context(address, message_id)
+                    elif name == "spawn":
+                        # Pass the current agent profile to the spawn tool
+                        if hasattr(tool, "set_agent_profile"):
+                            tool.set_agent_profile(agent_profile)
+                        tool.set_context(address, session_key)
                     else:
                         tool.set_context(address, session_key)
 
@@ -574,6 +583,7 @@ class AgentLoop:
         *,
         message_id: str | None = None,
         agent_runner: AgentRunner | None = None,
+        agent_profile: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -584,6 +594,7 @@ class AgentLoop:
         """
         loop_self = self
         session_key = address.to_uri()
+        loop_self._set_tool_context(address, session_key, message_id, agent_profile)
 
         class _LoopHook(AgentHook):
             def __init__(self) -> None:
@@ -622,7 +633,7 @@ class AgentLoop:
                 for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(address, session_key, message_id)
+                loop_self._set_tool_context(address, session_key, message_id, agent_profile)
 
             def finalize_content(
                 self, context: AgentHookContext, content: str | None
@@ -933,7 +944,6 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(
             session, self.context_window_tokens
         )
-        self._set_tool_context(address, key, msg.metadata.get("message_id"))
 
         history = session.get_history(max_messages=0)
         current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -948,9 +958,12 @@ class AgentLoop:
         # Warn on unexpected agent profile override from metadata
         agent_profile = msg.metadata.get("agent_profile")
         if agent_profile:
-            logger.warning(
-                "Invalid for system msg to have agent profile in metadata: {}", agent_profile
-            )
+            agent_runner, success = self._apply_agent_profile(agent_profile)
+            if not success:
+                logger.warning("Invalid agent profile {}: falling back to defaults", agent_profile)
+            current_runner = agent_runner
+        else:
+            current_runner = self.runner
 
         progress_cb = on_progress or self._make_progress_callback(address)
 
@@ -961,6 +974,8 @@ class AgentLoop:
             on_progress=progress_cb,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            agent_runner=current_runner,
+            agent_profile=agent_profile,
         )
 
         self._save_turn(session, all_msgs, 1 + len(history))
@@ -1055,7 +1070,6 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(
             session, self.context_window_tokens
         )
-        self._set_tool_context(msg.address, key, msg.metadata.get("message_id"))
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1080,6 +1094,7 @@ class AgentLoop:
             on_stream_end=on_stream_end,
             message_id=msg.metadata.get("message_id"),
             agent_runner=agent_runner,
+            agent_profile=agent_profile,
         )
 
         if final_content is None:
