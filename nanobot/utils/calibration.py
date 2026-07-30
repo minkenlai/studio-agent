@@ -54,6 +54,7 @@ def _ensure_loaded() -> tuple[Dict[str, str], Path]:
     _CALIBRATION_FILE_PATH = get_workspace_path() / "model_calibration.json"
     return _MODEL_TO_SERIES_MAP, _CALIBRATION_FILE_PATH
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -82,7 +82,8 @@ Backend implementations include: `AnthropicClient`, `OpenAICompatClient`, `Azure
 
 ### Subagent System
 
-The `SubagentManager` (`nanobot/agent/subagent.py`) handles background task execution. Subagents are spawned via the `spawn` tool and run in a separate `AgentRunner` instance. The `spawn` tool dynamically documents available agent profiles (e.g., `fast`, `deep`, `balanced`), enabling the main agent to autonomously select the appropriate model. Subagents inherit the workspace context (`SOUL.md`, `USER.md`, `SUBAGENT.md`) and report back to the main agent through the `MessageBus` upon completion.
+The `SubagentManager` (`nanobot/agent/subagent.py`) handles background task execution. Subagents are spawned via the `spawn` tool and run in a separate `AgentRunner` instance. The `spawn` tool dynamically documents available agent profiles (e.g., `fast`, `deep`, `balanced`), enabling the main agent to autonomously select the appropriate model. Subagents inherit the workspace context (`SOUL.md`, `USER.md`, `SUBAGENT.md`) and report back to the main agent through the `MessageBus` upon completion. Subagents propagate the active agent profile through their entire lifecycle, ensuring that results are evaluated using the profile active at the time of spawn, regardless of subsequent topic pin changes.
+
 
 ### Memory System
 
@@ -91,15 +92,17 @@ Three-layer staging architecture:
 - **`MEMORY.md`** — Long-term invariants. Updated via manual synthesis (`memory-synthesize` skill) which reads from staging.
 - **`HISTORY.md`** — Append-only timestamped log. Searchable via grep-style tools.
 
-`MemoryConsolidator` appends incremental updates to `STAGING.md` after each turn (never overwrites `MEMORY.md` directly). Strict truncation protection (`finish_reason == "length"`) prevents corrupting STAGING.md/HISTORY.md. Periodic `memory-synthesize` skill reads from staging to update `MEMORY.md`. It uses the loop's own provider (full fallback chain) and the provider's configured `max_tokens`. Messages are never modified after writing (cache-friendly for prompt caching).
+`MemoryConsolidator` appends incremental updates to `STAGING.md` after each turn (never overwrites `MEMORY.md` directly). It implements a Write-Ahead Log (WAL) to checkpoint messages before the LLM call, preventing data loss during interruptions (e.g., `/restart`, `asyncio.CancelledError`). Strict truncation protection (`finish_reason == "length"`) prevents corrupting STAGING.md/HISTORY.md. Periodic `memory-synthesize` skill reads from staging to update `MEMORY.md`. It uses the loop's own provider (full fallback chain) and the provider's configured `max_tokens`. Messages are never modified after writing (cache-friendly for prompt caching).
 
 ### Skill System
 
 `SkillsLoader` scans `~/.nanobot/workspace/skills/` for directories containing `SKILL.md`. Some skills are `always_skills` (always loaded into context); others are on-demand. Bundled skills live in `nanobot/skills/`.
 
-### Command System
+### TTS System
 
-Built-in slash commands are registered in `nanobot/command/builtin.py`. The `/status` command is a consolidated dashboard providing system uptime, token usage, context estimation, and active background tasks. Commands like `/new`, `/compact`, `/repl`, and `/restart` manage session lifecycle and development operations. The `/repl` command allows executing arbitrary Python code for debugging and system management. For security, it is restricted to users listed in `repl.allowUsers` (default: `["cli:user"]`). Access can be granted to other users using the format `"channel:sender_id"` (e.g., `"tg:12345678"`).
+Integrated Text-to-Speech capabilities via `AgentLoop.get_tts_client()`. Supported providers include `Chatterbox` (Local Nano/Turbo) and `OpenAI` (tts-1). Configuration is managed in `config.json` under the `tts` key. The `/speak` command triggers synthesis of specified text or the most recent assistant response.
+
+Built-in slash commands are registered in `nanobot/command/builtin.py`. The `/status` command is a consolidated dashboard providing system uptime, token usage, context estimation, and active background tasks. Commands like `/new`, `/compact`, `/repl`, `/restart`, and `/speak` manage session lifecycle, audio synthesis, and development operations. The `/repl` command allows executing arbitrary Python code for debugging and system management. For security, it is restricted to users listed in `repl.allowUsers` (default: `["cli:user"]`). Access can be granted to other users using the format `"channel:sender_id"` (e.g., `"tg:12345678"`).
 
 ### Channel Integration (Telegram)
 

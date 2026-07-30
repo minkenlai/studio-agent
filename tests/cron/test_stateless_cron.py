@@ -109,9 +109,27 @@ class TestStatelessPersistence:
                     "id": "legacy-1",
                     "name": "legacy-job",
                     "enabled": True,
-                    "schedule": {"kind": "every", "atMs": None, "everyMs": 60000, "expr": None, "tz": None},
-                    "payload": {"kind": "agent_turn", "message": "legacy", "deliver": False, "channel": None, "to": None},
-                    "state": {"nextRunAtMs": None, "lastRunAtMs": None, "lastStatus": None, "lastError": None, "runHistory": []},
+                    "schedule": {
+                        "kind": "every",
+                        "atMs": None,
+                        "everyMs": 60000,
+                        "expr": None,
+                        "tz": None,
+                    },
+                    "payload": {
+                        "kind": "agent_turn",
+                        "message": "legacy",
+                        "deliver": False,
+                        "channel": None,
+                        "to": None,
+                    },
+                    "state": {
+                        "nextRunAtMs": None,
+                        "lastRunAtMs": None,
+                        "lastStatus": None,
+                        "lastError": None,
+                        "runHistory": [],
+                    },
                     "createdAtMs": 0,
                     "updatedAtMs": 0,
                     "deleteAfterRun": False,
@@ -192,7 +210,7 @@ class TestStatelessSessionKeyGeneration:
             message="hello",
             stateless=True,
         )
-    
+
         key = self._build_on_cron_job_key_logic(job)
         # Format: cron://{id}:{uuid4_hex}
         parts = key.split(":")

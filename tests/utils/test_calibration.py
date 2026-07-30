@@ -17,6 +17,7 @@ def mock_workspace_path(tmp_path):
 def reset_calibration_state():
     """Reset lazy-loaded module state before each test."""
     import nanobot.utils.calibration as cal_module
+
     cal_module._CALIBRATION_FILE_PATH = None
     cal_module._MODEL_SERIES = None
     cal_module._MODEL_TO_SERIES_MAP = None
