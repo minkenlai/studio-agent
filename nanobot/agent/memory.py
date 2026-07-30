@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -153,6 +154,41 @@ class MemoryStore:
             return "\n".join(parts) if parts else ""
         return str(content)
 
+    def _write_wal(self, messages: list[dict]) -> Path:
+        """Write-ahead log: dump messages to a temp recovery file before the LLM call."""
+        now = datetime.now()
+        ts_file = now.strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"wal-{ts_file}.json"
+        path = self.recovery_dir / filename
+        path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug("WAL checkpoint written to {}", path)
+        return path
+
+    def _cleanup_wal(self, path: Path) -> None:
+        """Remove a WAL checkpoint file after successful consolidation."""
+        try:
+            if path.exists():
+                path.unlink()
+                logger.debug("WAL checkpoint cleaned up: {}", path)
+        except Exception:
+            logger.warning("Failed to cleanup WAL checkpoint {}", path)
+
+    @staticmethod
+    def _cleanup_stale_wals(recovery_dir: Path, max_age_hours: int = 24) -> int:
+        """Remove WAL files older than max_age_hours."""
+        cleaned = 0
+        cutoff = time.time() - (max_age_hours * 3600)
+        for path in recovery_dir.glob("wal-*.json"):
+            if path.stat().st_mtime < cutoff:
+                try:
+                    path.unlink()
+                    cleaned += 1
+                except Exception:
+                    pass
+        if cleaned:
+            logger.info("Cleaned up {} stale WAL file(s)", cleaned)
+        return cleaned
+
     async def consolidate(
         self,
         messages: list[dict],
@@ -182,6 +218,9 @@ class MemoryStore:
             },
             {"role": "user", "content": prompt},
         ]
+
+        MemoryStore._cleanup_stale_wals(self.recovery_dir)
+        wal_path = self._write_wal(messages)
 
         try:
             forced = {"type": "function", "function": {"name": "save_memory"}}
@@ -258,7 +297,12 @@ class MemoryStore:
 
             self._consecutive_failures = 0
             logger.info("Memory consolidation done for {} messages", len(messages))
+            self._cleanup_wal(wal_path)
             return entry
+        except asyncio.CancelledError:
+            logger.warning("Memory consolidation cancelled (WAL preserved at {})", wal_path)
+            self._fail_or_raw_archive(messages)
+            raise
         except Exception:
             logger.exception("Memory consolidation failed")
             self._fail_or_raw_archive(messages)

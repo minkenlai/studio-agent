@@ -456,8 +456,8 @@ class TestMemoryConsolidationTypeHandling:
 
         assert "⚠️ Synthesis failed" in store.history_file.read_text()
         assert "recovery/" in store.history_file.read_text()
-        # Verify the recovery sidecar file was created
-        recovery_files = list((tmp_path / "memory" / "recovery").glob("*.json"))
+        # Verify the recovery sidecar file was created (filter WAL files)
+        recovery_files = list((tmp_path / "memory" / "recovery").glob("raw-*.json"))
         assert len(recovery_files) == 1
         recovery_content = recovery_files[0].read_text()
         assert "msg0" in recovery_content
@@ -480,10 +480,19 @@ class TestMemoryConsolidationTypeHandling:
         assert await store.consolidate(messages, provider, "m") is None
         assert store._consecutive_failures == 2
 
+        wal_after_2_failures = list((tmp_path / "memory" / "recovery").glob("wal-*.json"))
+        assert len(wal_after_2_failures) == 2  # WAL files persist after failures
+
         provider.chat_with_retry = AsyncMock(return_value=ok_resp)
         assert await store.consolidate(messages, provider, "m") is not None
         assert store._consecutive_failures == 0
+        # The success call's own WAL is cleaned, but prior failure WALs remain (for recovery)
+        wal_after_success = list((tmp_path / "memory" / "recovery").glob("wal-*.json"))
+        assert len(wal_after_success) == 2  # only the 3rd (success) WAL was cleaned
 
         provider.chat_with_retry = AsyncMock(return_value=no_tool)
         assert await store.consolidate(messages, provider, "m") is None
         assert store._consecutive_failures == 1
+        # One more WAL from the final failure
+        wal_after_4th = list((tmp_path / "memory" / "recovery").glob("wal-*.json"))
+        assert len(wal_after_4th) == 3
