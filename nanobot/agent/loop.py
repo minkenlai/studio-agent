@@ -544,6 +544,11 @@ class AgentLoop:
                 msg += f"**Branch:** `{branch}`\n"
                 msg += f"**Commit:** `{sha}`"
 
+                # Check for pending memory recovery files
+                recovery_dir = self.workspace / "memory" / "recovery"
+                if recovery_dir.exists() and any(recovery_dir.iterdir()):
+                    msg += "\n\n⚠️ **Pending recovery data found** in `memory/recovery/`. I can integrate these files into your history if you'd like."
+
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         address=pending_notification,
