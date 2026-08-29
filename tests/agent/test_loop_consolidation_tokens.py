@@ -44,7 +44,7 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
 @pytest.mark.asyncio
 async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
-    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=("summary", None))  # type: ignore[method-assign]
 
     await loop.process_direct("hello", session_key="cli:test")
 
@@ -54,7 +54,7 @@ async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_prompt_above_threshold_triggers_consolidation(tmp_path, monkeypatch) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
-    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=("summary", None))  # type: ignore[method-assign]
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
         {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
@@ -74,7 +74,7 @@ async def test_prompt_above_threshold_archives_until_next_user_boundary(
     tmp_path, monkeypatch
 ) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
-    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=("summary", None))  # type: ignore[method-assign]
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
@@ -104,7 +104,7 @@ async def test_prompt_above_threshold_archives_until_next_user_boundary(
 async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> None:
     """Verify maybe_consolidate_by_tokens keeps looping until under threshold."""
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
-    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=("summary", None))  # type: ignore[method-assign]
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
@@ -156,7 +156,7 @@ async def test_consolidation_continues_below_trigger_until_half_target(
 ) -> None:
     """Once triggered, consolidation should continue until it drops below half threshold."""
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
-    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=("summary", None))  # type: ignore[method-assign]
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
@@ -206,7 +206,7 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 
     async def track_consolidate(messages):
         order.append("consolidate")
-        return True
+        return ("summary", None)
 
     loop.memory_consolidator.consolidate_messages = track_consolidate  # type: ignore[method-assign]
 

@@ -651,7 +651,7 @@ class TelegramChannel(BaseChannel):
         """Send a plain text message with HTML fallback."""
         try:
             html = _markdown_to_telegram_html(text)
-            await self._call_with_retry(
+            sent = await self._call_with_retry(
                 self._app.bot.send_message,
                 chat_id=chat_id,
                 text=html,
@@ -659,15 +659,21 @@ class TelegramChannel(BaseChannel):
                 reply_parameters=reply_params,
                 **(thread_kwargs or {}),
             )
+            logger.debug(
+                "Telegram API accepted message (HTML): id={} chat={}", sent.message_id, chat_id
+            )
         except Exception as e:
             logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
-                await self._call_with_retry(
+                sent = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=chat_id,
                     text=text,
                     reply_parameters=reply_params,
                     **(thread_kwargs or {}),
+                )
+                logger.debug(
+                    "Telegram API accepted message (Plain): id={} chat={}", sent.message_id, chat_id
                 )
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)

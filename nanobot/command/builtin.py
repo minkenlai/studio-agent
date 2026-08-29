@@ -494,44 +494,46 @@ async def cmd_stage(ctx: CommandContext) -> OutboundMessage:
         except ValueError:
             pass
 
-    sb = session.staged_boundary
-    desired = len(session.messages) - n_keep
-
-    if desired <= sb:
-        return OutboundMessage(
-            address=ctx.msg.address,
-            content="Nothing to stage (no unstaged messages).",
-        )
-
-    # D5 constraint: SB must never land mid tool-call exchange — a later
-    # free-drop would then cut the live history mid-exchange.
-    new_sb = _pick_stage_boundary(session.messages, sb, desired)
-    if new_sb is None or new_sb <= sb:
-        return OutboundMessage(
-            address=ctx.msg.address,
-            content=(
-                "⚠️ No safe staging boundary found (tail is mid tool-call exchange). "
-                "Try again once the current exchange completes."
-            ),
-        )
-
-    chunk = session.messages[sb:new_sb]
-    logger.info(
-        "cmd_stage: session=%s, total=%d, staged_boundary=%d, desired=%d, new_boundary=%d, chunk_size=%d, n_keep=%d",
-        session.key,
-        len(session.messages),
-        sb,
-        desired,
-        new_sb,
-        len(chunk),
-        n_keep,
-    )
-
     # Same consolidation pipeline as /compact; session_context is discarded
     # by design — the live messages are still the context. The boundary pick
-    # runs outside the lock (read-only); the distillation + SB advance are
-    # serialized with background/token-budget consolidation (F1).
+    # + chunk slice run INSIDE the lock (B-1): a concurrent drop between a
+    # pre-lock read and the lock would let a stale ``new_sb`` be written
+    # against a shrunken list (SB > len) and later free-drops/`/new` would
+    # delete live messages as if they were already staged.
     async with loop.memory_consolidator.get_lock(session.key):
+        sb = session.staged_boundary
+        desired = len(session.messages) - n_keep
+
+        if desired <= sb:
+            return OutboundMessage(
+                address=ctx.msg.address,
+                content="Nothing to stage (no unstaged messages).",
+            )
+
+        # D5 constraint: SB must never land mid tool-call exchange — a later
+        # free-drop would then cut the live history mid-exchange.
+        new_sb = _pick_stage_boundary(session.messages, sb, desired)
+        if new_sb is None or new_sb <= sb:
+            return OutboundMessage(
+                address=ctx.msg.address,
+                content=(
+                    "⚠️ No safe staging boundary found (tail is mid tool-call exchange). "
+                    "Try again once the current exchange completes."
+                ),
+            )
+
+        chunk = session.messages[sb:new_sb]
+        logger.info(
+            "cmd_stage: session=%s, total=%d, staged_boundary=%d, desired=%d, new_boundary=%d, chunk_size=%d, n_keep=%d",
+            session.key,
+            len(session.messages),
+            sb,
+            desired,
+            new_sb,
+            len(chunk),
+            n_keep,
+        )
+
         summary = await loop.memory_consolidator.archive_messages(chunk)
 
         if not summary:

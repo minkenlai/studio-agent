@@ -248,5 +248,6 @@ async def test_consolidate_messages_calls_transcribe():
     messages = [{"role": "user", "content": "hello"}]
     result = await consolidator.consolidate_messages(messages)
 
-    assert result is True
+    # Plain (non-tuple) store result is passed through with a None context.
+    assert result == (True, None)
     consolidator.store.consolidate.assert_called_once()

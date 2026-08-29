@@ -25,7 +25,7 @@ class MockToolCall:
 
 @pytest.mark.asyncio
 async def test_consolidate_messages_returns_summary_string(tmp_path):
-    """Verify consolidate_messages returns the summary string, not a boolean."""
+    """Verify consolidate_messages returns the summary entry (as a tuple), not a boolean."""
     # Setup
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -61,10 +61,13 @@ async def test_consolidate_messages_returns_summary_string(tmp_path):
     # Execute
     result = await consolidator.consolidate_messages(messages)
 
-    # Assert
-    assert result == summary_text
-    assert isinstance(result, str)
-    assert result is not True  # Specifically checking against the bug
+    # Assert: (history_entry, session_context) tuple; entry is the summary str.
+    assert isinstance(result, tuple)
+    entry, ctx = result
+    assert entry == summary_text
+    assert isinstance(entry, str)
+    assert entry is not True  # Specifically checking against the bug
+    assert ctx is None  # no session_context in the tool response
 
 
 @pytest.mark.asyncio
@@ -98,5 +101,5 @@ async def test_consolidate_messages_returns_none_on_failure(tmp_path):
     # Execute
     result = await consolidator.consolidate_messages(messages)
 
-    # Assert
-    assert result is None
+    # Assert: failure propagates as (None, None)
+    assert result == (None, None)

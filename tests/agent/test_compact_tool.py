@@ -4,7 +4,7 @@ Rewritten for the unified dispatch (D4):
 - free drop      — end_idx <= SB: physical delete, SB shifted, NO LLM call
 - commit + drop  — end_idx > SB: distill fresh [SB:end_idx], then drop [ctx_end:end_idx]
 - 80% guard      — fresh chunk larger than 80% of the consolidator's context window
-- injection      — dual-tagged user message only when _last_session_context is set
+- injection      — dual-tagged user message only when the seam returns a session_context
 """
 
 from pathlib import Path
@@ -55,8 +55,11 @@ def _make_tool(
         get_tool_definitions=lambda: [],
         max_completion_tokens=128,
     )
-    consolidator._last_session_context = session_ctx
-    consolidator.consolidate_messages = AsyncMock(return_value=summary_return)
+    # A-1: the distillation seam returns (entry, session_ctx); the context is
+    # carried through the return value, not shared instance state.
+    consolidator.consolidate_messages = AsyncMock(
+        return_value=(summary_return, session_ctx) if summary_return is not None else (None, None)
+    )
     return CompactHistoryTool(consolidator, session_manager)
 
 
@@ -265,7 +268,7 @@ class TestCompactHistorySummaryInjection:
 
     @pytest.mark.asyncio
     async def test_context_injected_into_session_messages(self, tmp_path: Path) -> None:
-        """With _last_session_context set, a dual-tagged user msg is inserted at ctx_end."""
+        """With a session_context returned by the seam, a dual-tagged user msg is inserted at ctx_end."""
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=3)  # 6 messages
         sm.save(session)
@@ -309,7 +312,7 @@ class TestCompactHistorySummaryInjection:
 
     @pytest.mark.asyncio
     async def test_no_injection_when_context_none(self, tmp_path: Path) -> None:
-        """Commit + drop without _last_session_context: no injected message."""
+        """Commit + drop with no session_context from the seam: no injected message."""
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=3)  # 6 messages
         sm.save(session)

@@ -82,7 +82,7 @@ class TestUnifiedDispatch:
         consolidator = _make_consolidator(tmp_path)
         session = _pairs_session("test:under", 4)
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value="entry")
+        mock_consolidate = AsyncMock(return_value=("entry", None))
 
         with (
             patch.object(
@@ -108,8 +108,8 @@ class TestUnifiedDispatch:
         mock_consolidate = AsyncMock()
 
         async def _consolidate(chunk):
-            consolidator._last_session_context = "Working on dispatch tests."
-            return "History entry 1."
+            # A-1: the context travels with the return value, not instance state.
+            return "History entry 1.", "Working on dispatch tests."
 
         mock_consolidate.side_effect = _consolidate
 
@@ -147,7 +147,7 @@ class TestUnifiedDispatch:
         consolidator = _make_consolidator(tmp_path)
         session = _pairs_session("test:plain", 4)
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value="History entry 2.")
+        mock_consolidate = AsyncMock(return_value=("History entry 2.", None))
 
         with (
             patch.object(
@@ -172,7 +172,7 @@ class TestUnifiedDispatch:
         consolidator = _make_consolidator(tmp_path)
         session = _pairs_session("test:free", 4, sb=5)  # staged [0:5]
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value="should not run")
+        mock_consolidate = AsyncMock(return_value=("should not run", None))
 
         with (
             patch.object(
@@ -211,7 +211,7 @@ class TestUnifiedDispatch:
         ]
         session.staged_boundary = 3
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value="should not run")
+        mock_consolidate = AsyncMock(return_value=("should not run", None))
 
         with (
             patch.object(
@@ -242,7 +242,7 @@ class TestUnifiedDispatchFailureModes:
         consolidator = _make_consolidator(tmp_path)
         session = _pairs_session("test:fail", 4)
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value=None)
+        mock_consolidate = AsyncMock(return_value=(None, None))
 
         with (
             patch.object(
@@ -279,7 +279,7 @@ class TestUnifiedDispatchFailureModes:
         consolidator = _make_consolidator(tmp_path)
         session = _pairs_session("test:heal", 4, sb=2)  # SB drifted to 2
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value="entry")
+        mock_consolidate = AsyncMock(return_value=("entry", None))
 
         with (
             patch.object(
@@ -309,7 +309,7 @@ class TestUnifiedDispatchFailureModes:
         session.add_message("user", "only")
         session.staged_boundary = 0
         monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
-        mock_consolidate = AsyncMock(return_value="should not run")
+        mock_consolidate = AsyncMock(return_value=("should not run", None))
 
         with (
             patch.object(
@@ -354,8 +354,8 @@ class TestInjectionDedup:
 
         async def _consolidate(_chunk):
             round_no[0] += 1
-            consolidator._last_session_context = f"CTX-R{round_no[0]}"
-            return f"History entry {round_no[0]}."
+            # A-1: the context travels with the return value, not instance state.
+            return f"History entry {round_no[0]}.", f"CTX-R{round_no[0]}"
 
         mock_consolidate.side_effect = _consolidate
 
@@ -412,8 +412,8 @@ class TestInjectionDedup:
         mock_consolidate = AsyncMock()
 
         async def _consolidate(_chunk):
-            consolidator._last_session_context = "CTX-FRESH"
-            return "History entry fresh."
+            # A-1: the context travels with the return value, not instance state.
+            return "History entry fresh.", "CTX-FRESH"
 
         mock_consolidate.side_effect = _consolidate
 
@@ -442,6 +442,122 @@ class TestInjectionDedup:
             "a2",
         ]
         assert session.staged_boundary == 1  # ctx_end(2) - (2 tagged - 1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stack_size, n_keep", [(3, 0), (4, 0), (5, 2)])
+    async def test_legacy_drift_large_stack_collapses_to_one_tagged(
+        self, tmp_path: Path, monkeypatch, stack_size: int, n_keep: int
+    ) -> None:
+        """Iteration-3 regression: legacy sessions hold one tagged msg per
+        pre-refactor compact. With a large stack the drift-collapse loop —
+        which deletes ascending indices — shifts the list under itself and
+        either raises IndexError mid-dispatch (after the fresh chunk is
+        already deleted from memory, before save) or silently deletes
+        untagged live messages and leaves a second tagged copy.
+
+        (3, 0): minimal stack — worked pre-fix, guards against regression.
+        (4, 0): empty tail at collapse (pure tagged prefix) → pre-fix
+            IndexError in the delete loop.
+        (5, 2): 2-message tail → pre-fix silent loss of an untagged message,
+            two tagged survive, SB desynced.
+        """
+        consolidator = _make_consolidator(tmp_path)
+        session = Session(key=f"test:drift{stack_size}")
+        session.messages = [
+            _tagged_msg(f"[Previous session context]: old{i}") for i in range(stack_size)
+        ]
+        for i in range(2):
+            session.messages.append(
+                {"role": "user", "content": f"u{i}", "timestamp": "2026-01-01T00:00:07"}
+            )
+            session.messages.append(
+                {"role": "assistant", "content": f"a{i}", "timestamp": "2026-01-01T00:00:08"}
+            )
+        session.staged_boundary = stack_size
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
+        mock_consolidate = AsyncMock()
+
+        async def _consolidate(_chunk):
+            # A-1: the context travels with the return value, not instance state.
+            return "History entry fresh.", "CTX-FRESH"
+
+        mock_consolidate.side_effect = _consolidate
+        end_idx = len(session.messages) - n_keep
+        with patch.object(consolidator, "consolidate_messages", new=mock_consolidate):
+            result = await consolidator.consolidate_range(session, end_idx)
+        assert result.error is None
+        mock_consolidate.assert_awaited_once()
+
+        # Exactly ONE tagged msg (the replacement), untagged tail intact,
+        # SB consistent with the shrunken pinned prefix.
+        tagged = [
+            m for m in session.messages if m.get("_session_context") or m.get("_compact_summary")
+        ]
+        assert len(tagged) == 1
+        assert tagged[0]["content"] == "[Previous session context]: CTX-FRESH"
+
+        kept = ["u1", "a1"] if n_keep == 2 else []
+        assert [m["content"] for m in session.messages] == [
+            "[Previous session context]: CTX-FRESH",
+        ] + kept
+        assert session.staged_boundary == 1
+
+
+class TestStaleEndIdxContract:
+    """Iteration-3 contract: callers compute ``end_idx`` OUTSIDE the lock
+    (``/compact`` and the tool read ``len(session.messages) - n_keep`` before
+    acquiring it), so a concurrent drop can shrink the session first and the
+    passed ``end_idx`` may exceed ``len``. The dispatch must clamp: never
+    operate past the live list, never drop an undistilled message, keep SB
+    valid. (These pin behavior; the clamp in ``_dispatch_drop`` is a no-op
+    hardening today because Python slicing already clamps.)"""
+
+    @pytest.mark.asyncio
+    async def test_end_idx_beyond_len_distills_all_fresh_no_loss(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        consolidator = _make_consolidator(tmp_path)
+        consolidator.context_window_tokens = 10**6  # keep the 80% guard out of the way
+        session = _pairs_session("test:stale", 8)  # 16 msgs, SB=0
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
+        mock_consolidate = AsyncMock(return_value=("History entry all.", "CTX-ALL"))
+
+        with patch.object(consolidator, "consolidate_messages", new=mock_consolidate):
+            result = await consolidator.consolidate_range(session, 100)
+
+        assert result.error is None
+        mock_consolidate.assert_awaited_once()
+        # Every non-pinned message went into the single distillation (nothing
+        # skipped, nothing lost to the floor of the list).
+        chunk = mock_consolidate.call_args_list[0][0][0]
+        expected = [c for i in range(8) for c in (f"u{i}", f"a{i}")]
+        assert [m["content"] for m in chunk] == expected
+        assert [m["content"] for m in session.messages] == ["[Previous session context]: CTX-ALL"]
+        assert session.staged_boundary == 1  # valid: 0 <= SB <= len
+
+    @pytest.mark.asyncio
+    async def test_end_idx_beyond_len_with_tagged_prefix_replaces_in_place(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        consolidator = _make_consolidator(tmp_path)
+        consolidator.context_window_tokens = 10**6
+        session = _pairs_session("test:stale-pfx", 4)  # 8 msgs
+        session.messages.insert(0, _tagged_msg("[Previous session context]: old"))
+        session.staged_boundary = 1
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: MSG_TOKENS)
+        mock_consolidate = AsyncMock(return_value=("History entry pfx.", "CTX-PFX"))
+
+        with patch.object(consolidator, "consolidate_messages", new=mock_consolidate):
+            result = await consolidator.consolidate_range(session, 50)
+
+        assert result.error is None
+        mock_consolidate.assert_awaited_once()
+        # Only the non-pinned tail was distilled; the pinned prefix was not.
+        chunk = mock_consolidate.call_args_list[0][0][0]
+        assert [m["content"] for m in chunk] == ["u0", "a0", "u1", "a1", "u2", "a2", "u3", "a3"]
+        # Old tagged copy replaced in place (no stacking, SB stays valid).
+        assert [m["content"] for m in session.messages] == ["[Previous session context]: CTX-PFX"]
+        assert session.staged_boundary == 1
 
 
 class TestSharedDispatchEntry:

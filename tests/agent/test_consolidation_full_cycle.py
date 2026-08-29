@@ -92,7 +92,7 @@ class TestFullConsolidationCycle:
         session = _build_overbudget_session(num_pairs=10)
 
         # No pre-existing context; the consolidation below produces one.
-        assert consolidator._last_session_context is None
+        # (A-1: the context now rides on the consolidate_messages return value.)
 
         # estimate: first call over budget (trigger), second under target (stop).
         estimate_calls = [0]
@@ -103,10 +103,12 @@ class TestFullConsolidationCycle:
                 return (10000, "mock")  # over budget → trigger consolidation
             return (100, "mock")  # under target → stop
 
-        # consolidate_messages: return a summary entry and set session_context.
+        # consolidate_messages: return a summary entry and a session_context.
         async def mock_consolidate(chunk):
-            consolidator._last_session_context = "Phase 2 consolidation cycle complete."
-            return "2026-08-06: Consolidated session messages."
+            return (
+                "2026-08-06: Consolidated session messages.",
+                "Phase 2 consolidation cycle complete.",
+            )
 
         mock_consolidate_msg = AsyncMock(side_effect=mock_consolidate)
         with (
@@ -171,8 +173,7 @@ class TestFullConsolidationCycle:
             return (100, "mock")
 
         async def mock_consolidate(chunk):
-            consolidator._last_session_context = "Pipeline build phase complete."
-            return "Consolidated pipeline work."
+            return "Consolidated pipeline work.", "Pipeline build phase complete."
 
         with (
             patch.object(
@@ -229,8 +230,10 @@ class TestFullConsolidationCycle:
 
         async def mock_consolidate(chunk):
             consolidate_calls[0] += 1
-            consolidator._last_session_context = f"Cycle {consolidate_calls[0]} context."
-            return f"Consolidated batch {consolidate_calls[0]}."
+            return (
+                f"Consolidated batch {consolidate_calls[0]}.",
+                f"Cycle {consolidate_calls[0]} context.",
+            )
 
         mock_consolidate_msg = AsyncMock(side_effect=mock_consolidate)
         with (

@@ -40,10 +40,11 @@ def _ctx(
         get_tool_definitions=lambda: [],
         max_completion_tokens=128,
     )
-    # Real MemoryConsolidator always has _last_session_context (None initially);
-    # set it explicitly so MagicMock auto-attribution can't fake a truthy context.
-    consolidator._last_session_context = session_ctx
-    consolidator.consolidate_messages = AsyncMock(return_value=archive_result)
+    # The distillation seam returns (entry, session_ctx); the context is
+    # carried through the return value (A-1), not shared instance state.
+    consolidator.consolidate_messages = AsyncMock(
+        return_value=(archive_result, session_ctx) if archive_result is not None else (None, None)
+    )
     mock_loop.memory_consolidator = consolidator
     ctx = MagicMock()
     ctx.loop = mock_loop
@@ -150,13 +151,13 @@ class TestCompactCommitDrop:
         archive.assert_awaited_once()
         chunk = archive.call_args[0][0]
         assert [m["content"] for m in chunk] == ["msg4", "msg5", "msg6"]  # [SB:end_idx]
-        # [ctx_end:end_idx] removed; no context injection (no _last_session_context)
+        # [ctx_end:end_idx] removed; no context injection (seam returned a None context)
         assert [m["content"] for m in session.messages] == ["msg7", "msg8", "msg9"]
         assert session.staged_boundary == 0
         mock_loop.sessions.save.assert_called_with(session)
 
     async def test_commit_drop_injects_dual_tagged_context(self):
-        """With _last_session_context set, a dual-tagged msg is inserted at ctx_end, SB+1."""
+        """With a session_context returned by the seam, a dual-tagged msg is inserted at ctx_end, SB+1."""
         session = _session("t:6", 10, sb=4)
         ctx, mock_loop = _ctx(
             session, "/compact", session_ctx="Working on the consolidation cutover."

@@ -231,8 +231,10 @@ Phase 1 proceeds now. Phase 2 is the cutover (highest care). Q4/Q5 are post-impl
     failure-no-loss / dual-tag injection via lightweight ctx mocks.
   - `test_compact_tool.py`: full rewrite (25 tests) — unified dispatch
     paths incl. 80% consolidator-context guard, pinned-prefix free drop,
-    staged-boundary self-reset, no-injection when `_last_session_context`
-    unset, repeated-call behavior.
+    staged-boundary self-reset, no-injection when the seam returns a
+    `None` session_context (⚠️2026-08-28 A-1: was `_last_session_context`
+    unset — that field is deleted; context rides on the seam's tuple),
+    repeated-call behavior.
   - `test_drop_inject.py`: full rewrite — injection only on commit+drop
     through the real `maybe_consolidate_by_tokens` dispatch.
   - `test_consolidation_full_cycle.py`: full rewrite — round 1 commit+drop

@@ -1,5 +1,14 @@
 # SPEC — Unified Consolidation Refactor (Review-Findings PR)
 
+> **STATUS (2026-08-28):** Implemented in `268613b`; iteration-2 findings
+> B-1 + A-1 fixed in `e863cb7`. Two sections of this spec are **SUPERSEDED** by
+> A-1 (marked ⚠️A-1): the `_last_session_context` field no longer exists — the
+> distilled context now travels through the `consolidate_messages` /
+> `_consolidate_with_retry` return value as `(entry, session_ctx)` tuples, and
+> `_dispatch_drop` injects from that local. §1.4's `archive_messages` call was
+> implemented as `_consolidate_with_retry` (same 3-attempt durability, keeps the
+> mockable seam) — see KB `Consolidation_Infrastructure.md` "Key Gotchas".
+
 Worktree: `/home/nanobot/.nanobot/workspace/nanobot-dev` (branch `dev`, base `f37a55a`).
 Fixes the adjudicated review findings: F1/S1 (locking), F4 (guard divergence),
 S2 (injection stacking), S3 (docstring). F3 = deliberately skipped (see below),
@@ -43,7 +52,9 @@ async def _dispatch_drop(self, session, end_idx: int) -> DropResult:
      token-path from 1 attempt to full durability — intentional unification.
      Falsy → `DropResult(error="summary generation failed...")`, nothing dropped.
    - `del messages[ctx_end:end_idx]`; `SB = ctx_end`
-   - **Injection with dedup** (see §2) when `_last_session_context` truthy.
+    - ⚠️A-1 (superseded): injection used `_last_session_context`; the field is
+      deleted — `_consolidate_with_retry` returns `(summary, session_ctx)` and
+      injection uses the local `session_ctx`.
    - save.
 5. Return result.
 
@@ -51,7 +62,7 @@ async def _dispatch_drop(self, session, end_idx: int) -> DropResult:
 Replace the current insert-at-ctx_end block (memory.py:736-745). After the drop:
 
 ```python
-if self._last_session_context:
+if session_ctx:  # ⚠️A-1: was `self._last_session_context` (field deleted in e863cb7)
     summary_msg = {...}  # unchanged dual-tagged dict
     tagged = [i for i in range(ctx_end)
               if session.messages[i].get("_session_context")
@@ -106,8 +117,10 @@ da068a7 debug logging stays; remove/gate at release.
 ## Test plan (TDD: write/red first, then implement)
 
 A. `tests/agent/test_unified_dispatch.py` — extend:
-   1. `test_commit_drop_replaces_existing_tagged_context` (S2): 8 pairs,
-      SB=0, `_last_session_context` set by a side_effect that also distinguishes
+    1. `test_commit_drop_replaces_existing_tagged_context` (S2): 8 pairs,
+       SB=0, the mocked `consolidate_messages` seam returns
+       `("History entry R1", "CTX-R1")` / `("...", "CTX-R2")` tuples that
+       distinguish ⚠️A-1 (was: `_last_session_context` set by side_effect)
       round 1 vs 2 (e.g. "CTX-R1" / "CTX-R2"). Estimates: (BUDGET, BUDGET, 100)
       → two commit+drop rounds (round 1 boundary 4, round 2 boundary 4 on the
       shifted list). Assert: consolidate awaited TWICE; 2nd chunk ==

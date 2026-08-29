@@ -480,9 +480,6 @@ class MemoryConsolidator:
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-        # Transient: stores the last session_context from a consolidation
-        # so Phase 2 can inject it as a summary message after dropping old msgs.
-        self._last_session_context: str | None = None
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -515,6 +512,14 @@ class MemoryConsolidator:
         (older drifted copies removed) instead of stacked.
         """
         ctx_end = Session.context_prefix_len(session.messages)
+        # Callers compute ``end_idx`` OUTSIDE the lock (e.g. ``/compact`` reads
+        # ``len(session.messages) - n_keep`` before acquiring it); a concurrent
+        # drop may have shrunk the session since. Clamp to the current end so
+        # the dispatch never operates past the live list. Today every slice
+        # below already clamps implicitly (Python semantics), so this is a
+        # no-op hardening — it pins the contract explicitly and protects any
+        # future arithmetic on ``end_idx`` inside the core.
+        end_idx = min(end_idx, len(session.messages))
         chunk = session.messages[ctx_end:end_idx]
         if not chunk:
             return DropResult(error="Nothing to summarize (session is already fully compacted).")
@@ -561,7 +566,7 @@ class MemoryConsolidator:
                 )
             )
 
-        summary = await self._consolidate_with_retry(fresh)
+        summary, session_ctx = await self._consolidate_with_retry(fresh)
         if not summary:
             # Summary generation failed — do NOT drop or advance SB.
             logger.warning(
@@ -581,11 +586,14 @@ class MemoryConsolidator:
         session.staged_boundary = ctx_end
 
         # Inject session context at the new pinned prefix so the agent keeps
-        # continuity after the raw messages are gone.
-        if self._last_session_context:
+        # continuity after the raw messages are gone. ``session_ctx`` comes
+        # from THIS distillation (returned through the seam, not shared
+        # instance state) so another session's background archive can never
+        # leak in.
+        if session_ctx:
             summary_msg = {
                 "role": "user",
-                "content": f"[Previous session context]: {self._last_session_context}",
+                "content": f"[Previous session context]: {session_ctx}",
                 "_session_context": True,
                 "_compact_summary": True,
                 "timestamp": datetime.now().isoformat(),
@@ -599,8 +607,11 @@ class MemoryConsolidator:
             if tagged:
                 # Replace the newest tagged message in place; remove any older
                 # drifted copies (legacy sessions may hold more than one).
+                # Iterate in REVERSE so deleting a higher index never shifts
+                # the lower indices still to be deleted (ascending deletion
+                # walks off the end of the list or eats untagged messages).
                 keep = tagged[-1]
-                for i in tagged[:-1]:
+                for i in reversed(tagged[:-1]):
                     del session.messages[i]
                     keep -= 1
                 session.messages[keep] = summary_msg
@@ -621,38 +632,45 @@ class MemoryConsolidator:
             staged_boundary=session.staged_boundary,
         )
 
-    async def _consolidate_with_retry(self, messages: list[dict[str, object]]) -> str | None:
+    async def _consolidate_with_retry(
+        self, messages: list[dict[str, object]]
+    ) -> tuple[str | None, str | None]:
         """Distill a fresh chunk with guaranteed persistence.
 
         Same retry loop as :meth:`archive_messages` (retries until the
         raw-dump fallback engages), run against ``consolidate_messages`` so
         callers/tests can substitute that seam directly.
+
+        Returns ``(history_entry, session_context)`` — the context is carried
+        through the return value (not shared instance state) so it can never
+        leak across sessions. ``(None, None)`` if distillation failed.
         """
         for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
             result = await self.consolidate_messages(messages)
-            if result is not None:
+            # A (None, None) tuple IS a failure (entry is None) — keep retrying.
+            if result is not None and result[0] is not None:
                 return result
-        return None
+        return (None, None)
 
-    async def consolidate_messages(self, messages: list[dict[str, object]]) -> str | None:
+    async def consolidate_messages(
+        self, messages: list[dict[str, object]]
+    ) -> tuple[str | None, str | None]:
         """Archive a selected message chunk into persistent memory.
 
-        Returns the history_entry summary on success, or None on failure.
-        If session_context was returned by the consolidation, it is stored in
-        ``self._last_session_context`` for downstream injection (Phase 2).
+        Returns ``(history_entry, session_context)`` on success, or
+        ``(None, None)`` on failure. ``session_context`` is the distilled
+        session context to be injected as a pinned prefix message (or None).
         """
         messages = await self._transcribe_audio(messages)
         result = await self.store.consolidate(messages, self.provider, self.model)
         if result is None:
-            return None
+            return (None, None)
         if isinstance(result, tuple):
             entry, ctx = result
-            self._last_session_context = ctx
-            return entry
+            return (entry, ctx)
         # Backward compat: if store.consolidate was mocked/patched to return
         # a plain truthy value (e.g., True), pass it through.
-        self._last_session_context = None
-        return result
+        return (result, None)
 
     async def _transcribe_audio(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
         """Transcribe audio blocks in messages before memory consolidation."""
@@ -807,13 +825,16 @@ class MemoryConsolidator:
         """Archive messages with guaranteed persistence (retries until raw-dump fallback).
 
         Returns the history_entry summary on success, or None on failure.
+        The distilled session_context is discarded by design: this seam is
+        used for standalone archival (/new tail, /stage) where nothing is
+        dropped, so an injected context summary would be noise.
         """
         if not messages:
             return None
         for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
-            result = await self.consolidate_messages(messages)
-            if result is not None:
-                return result
+            entry, _ctx = await self.consolidate_messages(messages)
+            if entry is not None:
+                return entry
         return None
 
     async def maybe_consolidate_by_tokens(

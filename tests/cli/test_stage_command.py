@@ -34,7 +34,10 @@ def _ctx(session, raw, archive_result="summary text"):
         get_tool_definitions=lambda: [],
         max_completion_tokens=128,
     )
-    consolidator.consolidate_messages = AsyncMock(return_value=archive_result)
+    # consolidate_messages now returns (entry, ctx); entry None = failure.
+    consolidator.consolidate_messages = AsyncMock(
+        return_value=(archive_result, None) if archive_result is not None else (None, None)
+    )
     mock_loop.memory_consolidator = consolidator
     ctx = MagicMock()
     ctx.loop = mock_loop
@@ -230,3 +233,57 @@ async def test_cmd_stage_acquires_consolidator_lock():
     # Untouched — the command blocked before distilling or advancing SB.
     assert len(session.messages) == 4
     assert session.staged_boundary == 0
+
+
+@pytest.mark.asyncio
+async def test_cmd_stage_recomputes_boundary_inside_lock_toctou():
+    """B-1: the boundary pick + chunk slice must happen INSIDE the session lock.
+
+    Reproduces the TOCTOU: a concurrent consolidation (free-drop) shrinks the
+    session while /stage is parked on the lock. If the pick was computed
+    pre-lock, the stale ``new_sb`` is written after the shrink, yielding
+    ``SB > len(messages)`` — which a later /new or free-reclaim then turns into
+    silent data loss (it treats live messages as already-staged and deletes them).
+
+    Setup: 6 msgs (u0,a1,u2,a3,u4,a5), SB=0. Pre-lock, /stage picks
+    ``new_sb=4`` (largest user-turn cut at/below desired=6) and slices
+    ``chunk=[u0,a1,u2,a3]``. While it waits on the lock we delete 4 msgs,
+    leaving 2 (u4,a5). After the fix, /stage re-reads inside the lock and lands
+    SB at a valid index; on the buggy code it writes the stale ``new_sb=4`` >
+    the new len of 2.
+    """
+    session = Session(key="test:stage_toctou")
+    roles = ["user", "assistant"]
+    for i in range(6):
+        session.add_message(roles[i % 2], f"m{i}")
+    session.staged_boundary = 0
+
+    ctx, mock_loop = _ctx(session, "/stage")
+    consolidator = mock_loop.memory_consolidator
+    lock = consolidator.get_lock(session.key)
+    await lock.acquire()
+    try:
+        # Start /stage; it runs its (sync) pre-lock reads, then parks on the lock.
+        task = asyncio.create_task(cmd_stage(ctx))
+        await asyncio.sleep(0)  # let it reach the lock
+
+        # Simulate a concurrent free-drop that removed 4 already-staged messages.
+        # (The exact mechanism is irrelevant; the trigger is that the list shrinks
+        # and SB is whatever a real drop would leave it at.)
+        del session.messages[0:4]
+        # now: [u4, a5], len=2. Buggy code will write stale new_sb=4 below.
+
+        lock.release()
+        resp = await task
+    finally:
+        if lock.locked():
+            lock.release()
+
+    # The invariant the refactor exists to hold: SB must be a valid index.
+    assert session.staged_boundary <= len(session.messages), (
+        f"SB ({session.staged_boundary}) exceeded live message count "
+        f"({len(session.messages)}) after a concurrent drop — the stage "
+        f"boundary was picked outside the lock"
+    )
+    assert len(session.messages) == 2  # the concurrent drop's shrink is intact
+    assert "Staged" in resp.content

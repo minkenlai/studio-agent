@@ -256,6 +256,7 @@ class ChannelManager:
         for attempt in range(max_attempts):
             try:
                 await self._send_once(channel, msg)
+                logger.debug("Successfully dispatched message to {}: {}", msg.channel, msg.address)
                 return  # Send succeeded
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown

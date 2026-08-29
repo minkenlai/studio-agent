@@ -35,7 +35,7 @@ def _ctx(session, raw="/new"):
         get_tool_definitions=lambda: [],
         max_completion_tokens=128,
     )
-    consolidator.consolidate_messages = AsyncMock(return_value="summary")
+    consolidator.consolidate_messages = AsyncMock(return_value=("summary", None))
     mock_loop.memory_consolidator = consolidator
     mock_loop._schedule_background = MagicMock()
     ctx = MagicMock()
