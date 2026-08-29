@@ -1,12 +1,18 @@
 """File system tools: read, write, edit, list."""
 
 import difflib
+import json
 import mimetypes
+import subprocess
+import time
+from logging import getLogger
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
+
+logger = getLogger(__name__)
 
 
 def _resolve_path(
@@ -338,8 +344,146 @@ class EditFileTool(_FsTool):
 
 
 # ---------------------------------------------------------------------------
-# list_dir
+# search_files
 # ---------------------------------------------------------------------------
+
+
+class SearchFilesTool(_FsTool):
+    """Search for text patterns in files using ripgrep (rg)."""
+
+    _DEFAULT_LIMIT = 50
+
+    @property
+    def name(self) -> str:
+        return "search_files"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search for text patterns in files using ripgrep (rg). "
+            "Returns matches with file paths and line numbers. "
+            "Can be restricted to a specific directory."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The text or regex pattern to search for",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to search in (defaults to workspace root)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default 50)",
+                    "minimum": 1,
+                },
+            },
+            "required": ["query"],
+        }
+
+    _TIMEOUT_SECONDS = 15
+
+    async def execute(
+        self,
+        query: str | None = None,
+        path: str | None = None,
+        limit: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        try:
+            if not query:
+                raise ValueError("Unknown query")
+            if query.startswith("-"):
+                raise ValueError("Query must not start with '-' (reserved for options)")
+
+            search_path = self._resolve(path) if path else self._workspace
+            if search_path is None:
+                search_path = Path.cwd()
+
+            if not search_path.exists():
+                return f"Error: Path {path} not found"
+
+            # rg --json event schema:
+            #   {"type": "begin", "data": {"path": {"text": ...}}}
+            #   {"type": "match", "data": {"path": {"text": ...},
+            #                               "line_number": N, "lines": {"text": ...}}}
+            # --no-config: ignore user rg config; --max-columns: cap line width.
+            cmd = [
+                "rg",
+                "--json",
+                "--no-config",
+                "--max-columns",
+                "500",
+                query,
+                str(search_path),
+            ]
+
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+
+            results: list[str] = []
+            match_count = 0
+            effective_limit = limit or self._DEFAULT_LIMIT
+            deadline = time.monotonic() + self._TIMEOUT_SECONDS
+
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") == "match":
+                    payload = data.get("data", {})
+                    file_path = payload.get("path", {}).get("text", "unknown")
+                    line_num = payload.get("line_number", "?")
+                    line_text = payload.get("lines", {}).get("text", "").strip()
+                    results.append(f"{file_path}:{line_num}: {line_text}")
+                    match_count += 1
+
+                    if match_count >= effective_limit:
+                        process.terminate()
+                        break
+
+                if time.monotonic() > deadline:
+                    logger.warning("search_files: timed out after %ds", self._TIMEOUT_SECONDS)
+                    process.terminate()
+                    break
+
+            process.stdout.close()
+            stderr_text = process.stderr.read() or ""
+            process.stderr.close()
+            process.wait()
+
+            if not results:
+                # rg exit codes: 0 = matches found, 1 = no matches (normal),
+                # >= 2 = real error (bad regex, unreadable path, ...).
+                if process.returncode in (0, 1):
+                    return "No matches found."
+                return f"Error: ripgrep failed (exit {process.returncode}): {stderr_text.strip()[:300]}"
+
+            output = "\n".join(results)
+            if match_count >= effective_limit:
+                output += f"\n\n(Truncated to {effective_limit} results. More may exist.)"
+
+            return output
+
+        except FileNotFoundError:
+            return "Error: ripgrep (rg) is not installed on the host system."
+        except PermissionError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            return f"Error searching files: {e}"
 
 
 class ListDirTool(_FsTool):

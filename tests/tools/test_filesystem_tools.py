@@ -1,11 +1,15 @@
 """Tests for enhanced filesystem tools: ReadFileTool, EditFileTool, ListDirTool."""
 
+import shutil
+from unittest.mock import patch
+
 import pytest
 
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
+    SearchFilesTool,
     _find_match,
 )
 
@@ -401,3 +405,90 @@ class TestWorkspaceRestriction:
         assert "Error" in result
         assert "outside" in result.lower()
         assert skill_file.read_text() == "# Weather\nOriginal content."
+
+
+# ---------------------------------------------------------------------------
+# SearchFilesTool
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep (rg) is not installed")
+class TestSearchFilesTool:
+    @pytest.fixture()
+    def tool(self, tmp_path):
+        return SearchFilesTool(workspace=tmp_path)
+
+    @pytest.fixture()
+    def corpus(self, tmp_path):
+        (tmp_path / "alpha.txt").write_text("needle in alpha\nno match here\n", encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "beta.txt").write_text("another needle line\n", encoding="utf-8")
+        return tmp_path
+
+    @pytest.mark.asyncio
+    async def test_basic_match_with_path_and_lineno(self, tool, corpus):
+        result = await tool.execute(query="needle", path=str(corpus))
+        assert "alpha.txt:1: needle in alpha" in result
+        assert "beta.txt:1: another needle line" in result
+        assert "Error" not in result
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_workspace_root(self, tool, corpus):
+        result = await tool.execute(query="needle")
+        assert "alpha.txt" in result
+
+    @pytest.mark.asyncio
+    async def test_no_matches(self, tool, corpus):
+        result = await tool.execute(query="nonexistent-needle-xyz", path=str(corpus))
+        assert "No matches found." in result
+
+    @pytest.mark.asyncio
+    async def test_limit_truncates(self, tool, tmp_path):
+        (tmp_path / "many.txt").write_text(
+            "\n".join(f"match line {i}" for i in range(30)), encoding="utf-8"
+        )
+        result = await tool.execute(query="match", path=str(tmp_path), limit=5)
+        assert "match line 0" in result
+        assert "match line 4" in result
+        assert "match line 5" not in result
+        assert "Truncated to 5 results" in result
+
+    @pytest.mark.asyncio
+    async def test_empty_query_rejected(self, tool):
+        result = await tool.execute(query="")
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_dash_query_rejected(self, tool, corpus):
+        """Queries starting with '-' must be rejected, not passed as rg flags."""
+        result = await tool.execute(query="--stats", path=str(corpus))
+        assert "Error" in result
+        assert "reserved for options" in result
+
+    @pytest.mark.asyncio
+    async def test_path_outside_workspace_blocked(self, tool, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("hidden needle\n", encoding="utf-8")
+        # Tool restricted to a sub-directory
+        restricted = tmp_path / "inside"
+        restricted.mkdir()
+        tool_r = SearchFilesTool(workspace=restricted, allowed_dir=restricted)
+        result = await tool_r.execute(query="needle", path=str(outside))
+        assert "Error" in result
+        assert "outside" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_invalid_regex_reports_rg_error(self, tool, corpus):
+        result = await tool.execute(query="([", path=str(corpus))
+        assert "Error" in result
+        assert "rg" in result.lower() or "ripgrep" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_rg_not_installed(self, tmp_path):
+        tool = SearchFilesTool(workspace=tmp_path)
+        with patch(
+            "nanobot.agent.tools.filesystem.subprocess.Popen", side_effect=FileNotFoundError
+        ):
+            result = await tool.execute(query="x")
+        assert "ripgrep (rg) is not installed" in result
