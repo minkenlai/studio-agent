@@ -32,6 +32,10 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.memory_consolidator._SAFETY_BUFFER = 0
+    # The token-budget tests exercise the CHAT session's context ceiling. Give
+    # the summarizer (consolidator) its own large context so the shared 80%
+    # guard (summarizer-capacity concern) doesn't trip on the test's small budget.
+    loop.memory_consolidator.context_window_tokens = 10_000_000
     # Mock registry.get_runner to return the existing runner (avoids provider build)
     loop.registry.get_runner = MagicMock(return_value=loop.runner)
     return loop
@@ -91,7 +95,9 @@ async def test_prompt_above_threshold_archives_until_next_user_boundary(
 
     archived_chunk = loop.memory_consolidator.consolidate_messages.await_args.args[0]
     assert [message["content"] for message in archived_chunk] == ["u1", "a1", "u2", "a2"]
-    assert session.last_consolidated == 4
+    # Commit + drop: [0:4] physically removed, SB reset to ctx_end (0); no injection.
+    assert session.staged_boundary == 0
+    assert [message["content"] for message in session.messages] == ["u3"]
 
 
 @pytest.mark.asyncio
@@ -128,7 +134,20 @@ async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> No
     await loop.memory_consolidator.maybe_consolidate_by_tokens(session, loop.context_window_tokens)
 
     assert loop.memory_consolidator.consolidate_messages.await_count == 2
-    assert session.last_consolidated == 6
+    # Round 1 distilled [0:4] (u1..a2), round 2 distilled [0:2] (u3, a3) of the
+    # remaining tail; only u4 stays live and SB sits at ctx_end (0).
+    first_chunk = [
+        m["content"]
+        for m in loop.memory_consolidator.consolidate_messages.await_args_list[0].args[0]
+    ]
+    second_chunk = [
+        m["content"]
+        for m in loop.memory_consolidator.consolidate_messages.await_args_list[1].args[0]
+    ]
+    assert first_chunk == ["u1", "a1", "u2", "a2"]
+    assert second_chunk == ["u3", "a3"]
+    assert session.staged_boundary == 0
+    assert [m["content"] for m in session.messages] == ["u4"]
 
 
 @pytest.mark.asyncio
@@ -167,7 +186,15 @@ async def test_consolidation_continues_below_trigger_until_half_target(
     await loop.memory_consolidator.maybe_consolidate_by_tokens(session, loop.context_window_tokens)
 
     assert loop.memory_consolidator.consolidate_messages.await_count == 2
-    assert session.last_consolidated == 6
+    # est2 (150) is below the trigger budget (200) but above the half-target
+    # (100): the loop must keep consolidating. Round 2 distills [0:2] (u3, a3).
+    second_chunk = [
+        m["content"]
+        for m in loop.memory_consolidator.consolidate_messages.await_args_list[1].args[0]
+    ]
+    assert second_chunk == ["u3", "a3"]
+    assert session.staged_boundary == 0
+    assert [m["content"] for m in session.messages] == ["u4"]
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ import re
 import tempfile
 import time
 import weakref
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -19,6 +20,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot.services.transcription import TranscriptionService
+from nanobot.session.manager import Session
 from nanobot.utils.helpers import (
     _extract_text,
     ensure_dir,
@@ -123,13 +125,31 @@ class MemoryStore:
     def write_long_term(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
 
+    def read_staging(self) -> str:
+        if self.staging_file.exists():
+            return self.staging_file.read_text(encoding="utf-8")
+        return ""
+
     def append_history(self, entry: str) -> None:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
+        """Return the memory block for the system prompt: long-term + staging.
+
+        STAGING.md holds consolidated knowledge that hasn't been synthesized into
+        MEMORY.md yet. Including it here makes consolidation output immediately
+        visible (and cross-session visible), instead of waiting for synthesis.
+        """
         long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        staging = self.read_staging().strip()
+
+        parts = []
+        if long_term:
+            parts.append(f"## Long-term Memory\n{long_term}")
+        if staging:
+            parts.append(f"## Staging Notes (pending synthesis)\n{staging}")
+        return "\n\n".join(parts)
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
@@ -412,6 +432,17 @@ class MemoryStore:
         )
 
 
+@dataclass
+class DropResult:
+    """Outcome of a unified drop dispatch (see ``MemoryConsolidator._dispatch_drop``)."""
+
+    dropped: int = 0  # messages physically removed
+    consolidated: bool = False  # LLM distillation ran (commit + drop case)
+    summary: str | None = None  # history entry from the distillation
+    error: str | None = None  # user-facing error (guard / failure); nothing dropped
+    staged_boundary: int = 0  # resulting staged boundary (for caller reply text)
+
+
 class MemoryConsolidator:
     """Owns consolidation policy, locking, and session offset updates."""
 
@@ -456,6 +487,152 @@ class MemoryConsolidator:
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    async def consolidate_range(self, session: Session, end_idx: int) -> DropResult:
+        """Public entry: drop ``[ctx_end : end_idx]`` under the session lock.
+
+        Used by the ``/compact`` command and the ``compact_history`` tool.
+        The automatic token-budget path (``maybe_consolidate_by_tokens``)
+        already holds the lock, so it calls ``_dispatch_drop`` directly.
+        """
+        async with self.get_lock(session.key):
+            return await self._dispatch_drop(session, end_idx)
+
+    async def _dispatch_drop(self, session: Session, end_idx: int) -> DropResult:
+        """Core of the unified drop dispatch (D4). Assumes the session lock is held.
+
+        3-case dispatch keyed on where ``end_idx`` falls relative to the
+        staged boundary (SB):
+
+        - free drop     — end_idx <= SB: physical delete, SB shift, no LLM
+        - commit + drop — end_idx >  SB: distill fresh [SB:end_idx] first,
+                          then drop [ctx_end:end_idx] together
+        - nothing to do — empty chunk
+
+        Never drops messages whose distillation failed (data-loss guard).
+        At most one tagged context message exists in the leading pinned run:
+        on commit + drop an already-injected context is replaced in place
+        (older drifted copies removed) instead of stacked.
+        """
+        ctx_end = Session.context_prefix_len(session.messages)
+        chunk = session.messages[ctx_end:end_idx]
+        if not chunk:
+            return DropResult(error="Nothing to summarize (session is already fully compacted).")
+
+        if end_idx <= session.staged_boundary:
+            # Free drop: [ctx_end:end_idx] was already distilled into
+            # STAGING.md at stage time — reclaim it without any LLM call.
+            del session.messages[ctx_end:end_idx]
+            session.staged_boundary = ctx_end + (session.staged_boundary - end_idx)
+            self.sessions.save(session)
+            logger.info(
+                "Free drop: removed {} already-staged messages (SB -> {}) for session {}",
+                len(chunk),
+                session.staged_boundary,
+                session.key,
+            )
+            return DropResult(
+                dropped=len(chunk),
+                staged_boundary=session.staged_boundary,
+            )
+
+        # Commit + drop: distill only the fresh part [SB:end_idx].
+        fresh = session.messages[session.staged_boundary : end_idx]
+
+        # Early guard: if the fresh chunk is too large for the consolidator's
+        # context, reject upfront rather than letting the LLM fail and losing data.
+        chunk_tokens = sum(estimate_message_tokens(m) for m in fresh)
+        if (
+            self.context_window_tokens > 0
+            and chunk_tokens > self.context_window_tokens * 0.8  # 80% threshold
+        ):
+            logger.warning(
+                "dispatch_drop: fresh chunk ({} tokens) exceeds consolidator context "
+                "({} x 80%) for session {} — skipping",
+                chunk_tokens,
+                self.context_window_tokens,
+                session.key,
+            )
+            return DropResult(
+                error=(
+                    f"⚠️ Compact failed: {len(fresh)} fresh messages ({chunk_tokens:,} tokens) exceed "
+                    f"the summarizer's context window ({self.context_window_tokens:,}). "
+                    f"Session history preserved. Consider compacting with n_keep > 0 first."
+                )
+            )
+
+        summary = await self._consolidate_with_retry(fresh)
+        if not summary:
+            # Summary generation failed — do NOT drop or advance SB.
+            logger.warning(
+                "dispatch_drop: summary failed for {} messages in session {} — "
+                "nothing dropped to prevent data loss",
+                len(fresh),
+                session.key,
+            )
+            return DropResult(
+                error=(
+                    f"⚠️ Compact failed: summary generation returned no result for {len(fresh)} messages. "
+                    f"Session history preserved. This may happen if the content exceeds the model's context window."
+                )
+            )
+
+        del session.messages[ctx_end:end_idx]
+        session.staged_boundary = ctx_end
+
+        # Inject session context at the new pinned prefix so the agent keeps
+        # continuity after the raw messages are gone.
+        if self._last_session_context:
+            summary_msg = {
+                "role": "user",
+                "content": f"[Previous session context]: {self._last_session_context}",
+                "_session_context": True,
+                "_compact_summary": True,
+                "timestamp": datetime.now().isoformat(),
+            }
+            tagged = [
+                i
+                for i in range(ctx_end)
+                if session.messages[i].get("_session_context")
+                or session.messages[i].get("_compact_summary")
+            ]
+            if tagged:
+                # Replace the newest tagged message in place; remove any older
+                # drifted copies (legacy sessions may hold more than one).
+                keep = tagged[-1]
+                for i in tagged[:-1]:
+                    del session.messages[i]
+                    keep -= 1
+                session.messages[keep] = summary_msg
+                session.staged_boundary -= len(tagged) - 1
+            else:
+                session.messages.insert(ctx_end, summary_msg)
+                session.staged_boundary += 1
+            logger.info(
+                "Injected (or replaced) session context at pinned prefix for session {}",
+                session.key,
+            )
+
+        self.sessions.save(session)
+        return DropResult(
+            dropped=len(chunk),
+            consolidated=True,
+            summary=summary,
+            staged_boundary=session.staged_boundary,
+        )
+
+    async def _consolidate_with_retry(self, messages: list[dict[str, object]]) -> str | None:
+        """Distill a fresh chunk with guaranteed persistence.
+
+        Same retry loop as :meth:`archive_messages` (retries until the
+        raw-dump fallback engages), run against ``consolidate_messages`` so
+        callers/tests can substitute that seam directly.
+        """
+        for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
+            result = await self.consolidate_messages(messages)
+            if result is not None:
+                return result
+        return None
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> str | None:
         """Archive a selected message chunk into persistent memory.
@@ -581,8 +758,12 @@ class MemoryConsolidator:
         session: Session,
         tokens_to_remove: int,
     ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
-        start = session.last_consolidated
+        """Pick a user-turn boundary that removes enough old prompt tokens.
+
+        Starts the walk at the end of the pinned context prefix (tag-scan),
+        so the picker only considers live (staged + fresh) messages.
+        """
+        start = Session.context_prefix_len(session.messages)
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
 
@@ -664,38 +845,33 @@ class MemoryConsolidator:
                     return
 
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
-                if boundary is None:
+                end_idx = boundary[0] if boundary else None
+
+                # 3-case dispatch (D4), keyed on where the picked boundary B
+                # falls relative to the staged boundary (SB). The core lives in
+                # _dispatch_drop (shared with /compact and the compact_history
+                # tool); the session lock is already held here.
+                ctx_end = Session.context_prefix_len(session.messages)
+                if end_idx is not None:
+                    end = end_idx
+                elif session.staged_boundary > ctx_end:
+                    # Fresh region too small for the picker, but the already
+                    # staged region is reclaimable for free (D4: pressure is
+                    # never stuck waiting for fresh to grow).
+                    end = session.staged_boundary
+                else:
                     return
 
-                end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated : end_idx]
-                if not chunk:
-                    return
-
-                if not await self.consolidate_messages(chunk):
-                    return
-                session.last_consolidated = end_idx
-
-                # Inject session context summary at the consolidation boundary
-                if self._last_session_context:
-                    # Remove any previous compact summary to avoid stacking
-                    session.messages = [
-                        m for m in session.messages if not m.get("_compact_summary")
-                    ]
-                    summary_msg = {
-                        "role": "user",
-                        "content": f"[Previous session context]: {self._last_session_context}",
-                        "_compact_summary": True,
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                    session.messages.insert(session.last_consolidated, summary_msg)
-                    logger.info(
-                        "Injected session context summary at boundary {} for session {}",
-                        session.last_consolidated,
+                result = await self._dispatch_drop(session, end)
+                if result.error:
+                    # Nothing was dropped (80% guard or distillation failure) —
+                    # retrying this round would repeat the same failure.
+                    logger.warning(
+                        "Token-budget consolidation stopped for session {}: {}",
                         session.key,
+                        result.error,
                     )
-
-                self.sessions.save(session)
+                    return
 
                 estimated, source = self.estimate_session_prompt_tokens(session)
                 if estimated <= 0:

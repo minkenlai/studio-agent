@@ -1,4 +1,9 @@
-"""Tests for session context injection after consolidation (drop-and-inject logic)."""
+"""Tests for session context injection after consolidation (drop-and-inject logic).
+
+Rewritten for the unified dispatch: injection happens ONLY on commit + drop,
+produces a NEW dual-tagged user message at ctx_end, and bumps SB by 1.
+Free drops inject nothing.
+"""
 
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ def workspace(tmp_path: Path) -> Path:
 def mock_provider() -> MagicMock:
     provider = MagicMock(spec=LLMClient)
     provider.generation = MagicMock()
-    provider.generation.context_max = 64000
+    provider.generation.context_max = None
     return provider
 
 
@@ -65,7 +70,7 @@ def session() -> Session:
         {"role": "user", "content": "msg3"},
         {"role": "assistant", "content": "reply3"},
     ]
-    s.last_consolidated = 0
+    s.staged_boundary = 0
     return s
 
 
@@ -76,88 +81,240 @@ class TestDropAndInject:
     async def test_inject_session_context_after_consolidation(
         self, session: Session, make_consolidator, sessions: SessionManager
     ):
-        """When _last_session_context is set and consolidation advances last_consolidated,
-        a summary message should be injected at the boundary."""
-        consolidator = make_consolidator(context_window_tokens=500)
+        """Commit + drop with _last_session_context set injects a context message.
+
+        The injection is a NEW message (insert at ctx_end), dual-tagged, with
+        content prefix '[Previous session context]: '. SB is bumped by 1.
+        """
+        consolidator = make_consolidator(context_window_tokens=6400)
+        # Simulates what consolidate_messages does on success: set the context.
         consolidator._last_session_context = "User is working on memory consolidation"
 
-        original_msg_count = len(session.messages)
+        estimate_calls = [0]
+
+        def mock_estimate(sess):
+            estimate_calls[0] += 1
+            return (10000, "mock") if estimate_calls[0] == 1 else (100, "mock")
 
         with (
+            patch.object(consolidator, "estimate_session_prompt_tokens", side_effect=mock_estimate),
             patch.object(
-                consolidator,
-                "estimate_session_prompt_tokens",
-                return_value=(10000, "mock"),
-            ),
-            patch.object(
-                consolidator,
-                "consolidate_messages",
-                new=AsyncMock(return_value="summary"),
+                consolidator, "consolidate_messages", new=AsyncMock(return_value="summary")
             ),
             patch.object(sessions, "save", new=MagicMock()),
         ):
-            await consolidator.maybe_consolidate_by_tokens(session, 500)
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
 
-        # A summary message should have been injected
         summary_msgs = [m for m in session.messages if m.get("_compact_summary")]
-        assert len(summary_msgs) >= 1, "Expected at least one summary message after consolidation"
-        summary = summary_msgs[-1]
-        assert summary["role"] == "user"
-        assert "[Previous session context]" in summary["content"]
-        assert "User is working on memory consolidation" in summary["content"]
-        assert len(session.messages) >= original_msg_count + 1
+        assert len(summary_msgs) == 1
+        injected = summary_msgs[0]
+        # Positioned at ctx_end (index 0 here — no pre-existing pinned prefix).
+        assert session.messages.index(injected) == 0
+        assert injected["role"] == "user"
+        assert injected["content"] == (
+            "[Previous session context]: User is working on memory consolidation"
+        )
+        assert injected["_session_context"] is True
+        assert injected["_compact_summary"] is True
+        # Dropped 6 staged+fresh, kept last 2, injected 1 -> 3 messages; SB = 0 + 1.
+        assert len(session.messages) == 3
+        assert session.staged_boundary == 1
 
     @pytest.mark.asyncio
     async def test_no_inject_when_context_is_none(
         self, session: Session, make_consolidator, sessions: SessionManager
     ):
-        """When _last_session_context is None, no summary message should be injected."""
-        consolidator = make_consolidator(context_window_tokens=500)
+        """No session_context from the consolidation -> no injection, but the drop still happens."""
+        consolidator = make_consolidator(context_window_tokens=6400)
         consolidator._last_session_context = None
 
-        original_msg_count = len(session.messages)
+        estimate_calls = [0]
+
+        def mock_estimate(sess):
+            estimate_calls[0] += 1
+            return (10000, "mock") if estimate_calls[0] == 1 else (100, "mock")
 
         with (
+            patch.object(consolidator, "estimate_session_prompt_tokens", side_effect=mock_estimate),
             patch.object(
-                consolidator,
-                "estimate_session_prompt_tokens",
-                return_value=(10000, "mock"),
-            ),
-            patch.object(
-                consolidator,
-                "consolidate_messages",
-                new=AsyncMock(return_value="summary"),
+                consolidator, "consolidate_messages", new=AsyncMock(return_value="summary")
             ),
             patch.object(sessions, "save", new=MagicMock()),
         ):
-            await consolidator.maybe_consolidate_by_tokens(session, 500)
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
 
         summary_msgs = [m for m in session.messages if m.get("_compact_summary")]
-        assert len(summary_msgs) == 0, "No summary should be injected when context is None"
-        assert len(session.messages) == original_msg_count
+        assert summary_msgs == []
+        # Commit + drop still physically dropped [0:6]; SB stays at ctx_end (0).
+        assert [m["content"] for m in session.messages] == ["msg3", "reply3"]
+        assert session.staged_boundary == 0
+        # _last_session_context must remain None.
+        assert consolidator._last_session_context is None
+
+    @pytest.mark.asyncio
+    async def test_inject_creates_new_message_not_mutation(
+        self, session: Session, make_consolidator, sessions: SessionManager
+    ):
+        """The injection inserts a new message; existing messages are only shifted."""
+        consolidator = make_consolidator(context_window_tokens=6400)
+        consolidator._last_session_context = "Context data"
+
+        original_count = len(session.messages)
+        original_ids = {id(m) for m in session.messages}
+
+        estimate_calls = [0]
+
+        def mock_estimate(sess):
+            estimate_calls[0] += 1
+            return (10000, "mock") if estimate_calls[0] == 1 else (100, "mock")
+
+        with (
+            patch.object(consolidator, "estimate_session_prompt_tokens", side_effect=mock_estimate),
+            patch.object(
+                consolidator, "consolidate_messages", new=AsyncMock(return_value="summary")
+            ),
+            patch.object(sessions, "save", new=MagicMock()),
+        ):
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
+
+        # 6 dropped, 1 injected -> count is NOT simply original + 1, but every
+        # surviving original message is the SAME dict object (no mutation/replace).
+        assert len(session.messages) == original_count - 6 + 1
+        surviving = [m for m in session.messages if not m.get("_compact_summary")]
+        assert all(id(m) in original_ids for m in surviving)
+        assert [m["content"] for m in surviving] == ["msg3", "reply3"]
+        assert len([m for m in session.messages if m.get("_compact_summary")]) == 1
+
+    @pytest.mark.asyncio
+    async def test_free_drop_injects_nothing(
+        self, session: Session, make_consolidator, sessions: SessionManager
+    ):
+        """FREE DROP (boundary within staged region) must not call the LLM and injects nothing."""
+        consolidator = make_consolidator(context_window_tokens=6400)
+        session.staged_boundary = 6  # [0:6] already staged
+
+        estimate_calls = [0]
+
+        def mock_estimate(sess):
+            estimate_calls[0] += 1
+            # est == budget exactly: passes the trigger gate; picker target
+            # (640) exceeds the real removed tokens, so the picker returns the
+            # LAST user boundary (idx 6), which lies in the staged region.
+            if estimate_calls[0] == 1:
+                return (1280, "mock")
+            return (100, "mock")
+
+        mock_consolidate = AsyncMock(return_value="summary")
+        with (
+            patch.object(consolidator, "estimate_session_prompt_tokens", side_effect=mock_estimate),
+            patch.object(consolidator, "consolidate_messages", new=mock_consolidate),
+            patch.object(sessions, "save", new=MagicMock()),
+        ):
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
+
+        # Picker returns the last user boundary (idx 6, msg3) — inside staged [0:6]
+        # -> free drop of [0:6].
+        mock_consolidate.assert_not_awaited()
+        assert [m for m in session.messages if m.get("_compact_summary")] == []
+        assert [m["content"] for m in session.messages] == ["msg3", "reply3"]
+        # SB shifted by the drop amount: 0 + (6 - 6) = 0.
+        assert session.staged_boundary == 0
+
+    @pytest.mark.asyncio
+    async def test_multiple_consolidation_rounds_preserve_context(
+        self, session: Session, make_consolidator, sessions: SessionManager
+    ):
+        """Round 1 (commit + drop) injects ONE context msg; a later round over the
+        staged region is a free drop — exactly one context message, no stacking.
+        """
+        consolidator = make_consolidator(context_window_tokens=6400)
+
+        # --- Round 1: commit + drop with injection ---
+        consolidator._last_session_context = "Round 1 context"
+        estimate_calls = [0]
+
+        def estimate_round1(sess):
+            estimate_calls[0] += 1
+            return (10000, "mock") if estimate_calls[0] == 1 else (100, "mock")
+
+        with (
+            patch.object(
+                consolidator, "estimate_session_prompt_tokens", side_effect=estimate_round1
+            ),
+            patch.object(
+                consolidator, "consolidate_messages", new=AsyncMock(return_value="summary")
+            ),
+            patch.object(sessions, "save", new=MagicMock()),
+        ):
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
+
+        assert len([m for m in session.messages if m.get("_compact_summary")]) == 1
+        assert "Round 1 context" in session.messages[0]["content"]
+        assert Session.context_prefix_len(session.messages) == 1  # new ctx_end
+
+        # --- New work arrives and is fully staged (SB advanced past ctx_end) ---
+        session.add_message("user", "msg4")
+        session.add_message("assistant", "reply4")
+        session.add_message("user", "msg5")
+        session.add_message("assistant", "reply5")
+        # state: [ctx(0), msg3(1), reply3(2), msg4(3), reply4(4), msg5(5), reply5(6)]
+        session.staged_boundary = 7  # everything after ctx is staged
+
+        # --- Round 2: picker boundary falls in staged region -> FREE DROP ---
+        mock_consolidate2 = AsyncMock(return_value="summary")
+        round2_calls = [0]
+
+        def estimate_round2(sess):
+            round2_calls[0] += 1
+            # est == budget exactly: passes the trigger gate, and the picker
+            # target (640) is far above the real removed tokens, so it returns
+            # the LAST user boundary (idx 5), which lies in the staged region.
+            if round2_calls[0] == 1:
+                return (1280, "mock")
+            return (100, "mock")
+
+        with (
+            patch.object(
+                consolidator, "estimate_session_prompt_tokens", side_effect=estimate_round2
+            ),
+            patch.object(consolidator, "consolidate_messages", new=mock_consolidate2),
+            patch.object(sessions, "save", new=MagicMock()),
+        ):
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
+
+        # Free drop: no LLM work, no second injection.
+        mock_consolidate2.assert_not_awaited()
+        summary_msgs = [m for m in session.messages if m.get("_compact_summary")]
+        assert len(summary_msgs) == 1
+        assert "Round 1 context" in summary_msgs[0]["content"]
+        assert Session.context_prefix_len(session.messages) == 1
+        # [1:5] (msg3, reply3, msg4, reply4) freed; SB' = ctx_end + (SB - B) = 1 + 2.
+        assert session.messages[0].get("_compact_summary") is True  # ctx kept
+        assert [m["content"] for m in session.messages[1:]] == ["msg5", "reply5"]
+        assert session.staged_boundary == 3
 
     @pytest.mark.asyncio
     async def test_injected_message_has_compact_summary_tag(
         self, session: Session, make_consolidator, sessions: SessionManager
     ):
         """Verify the injected message has _compact_summary: True."""
-        consolidator = make_consolidator(context_window_tokens=500)
+        consolidator = make_consolidator(context_window_tokens=6400)
         consolidator._last_session_context = "Context data"
 
+        estimate_calls = [0]
+
+        def mock_estimate(sess):
+            estimate_calls[0] += 1
+            return (10000, "mock") if estimate_calls[0] == 1 else (100, "mock")
+
         with (
+            patch.object(consolidator, "estimate_session_prompt_tokens", side_effect=mock_estimate),
             patch.object(
-                consolidator,
-                "estimate_session_prompt_tokens",
-                return_value=(10000, "mock"),
-            ),
-            patch.object(
-                consolidator,
-                "consolidate_messages",
-                new=AsyncMock(return_value="summary"),
+                consolidator, "consolidate_messages", new=AsyncMock(return_value="summary")
             ),
             patch.object(sessions, "save", new=MagicMock()),
         ):
-            await consolidator.maybe_consolidate_by_tokens(session, 500)
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
 
         summary_msgs = [m for m in session.messages if m.get("_compact_summary")]
         assert len(summary_msgs) == 1
@@ -167,15 +324,13 @@ class TestDropAndInject:
         """Verify get_history() preserves messages tagged with _compact_summary
         (doesn't drop them as leading non-user messages). The _compact_summary key
         itself is stripped from the output, but the message content is preserved."""
-        session.last_consolidated = 2
-
         # Insert a compact summary at the boundary
         summary_msg = {
             "role": "user",
             "content": "[Previous session context]: Some context",
             "_compact_summary": True,
         }
-        session.messages.insert(2, summary_msg)
+        session.messages.insert(0, summary_msg)
 
         history = session.get_history()
 
@@ -186,94 +341,4 @@ class TestDropAndInject:
         assert context_in_history, (
             "Compact summary message should be preserved in get_history() output"
         )
-
-    @pytest.mark.asyncio
-    async def test_inject_creates_new_message_not_mutation(
-        self, session: Session, make_consolidator, sessions: SessionManager
-    ):
-        """The injection appends a new message to session.messages, doesn't modify existing msgs."""
-        consolidator = make_consolidator(context_window_tokens=500)
-        consolidator._last_session_context = "Context data"
-
-        original_count = len(session.messages)
-
-        # 3 calls: initial estimate, post-consolidation, then loop check → stops
-        round_values = [10000, 100, 100]
-        round_index = [0]
-
-        def mock_estimate(sess):
-            val = round_values[round_index[0]]
-            round_index[0] += 1
-            return (val, "mock")
-
-        with (
-            patch.object(
-                consolidator,
-                "estimate_session_prompt_tokens",
-                side_effect=mock_estimate,
-            ),
-            patch.object(
-                consolidator,
-                "consolidate_messages",
-                new=AsyncMock(return_value="summary"),
-            ),
-            patch.object(sessions, "save", new=MagicMock()),
-        ):
-            await consolidator.maybe_consolidate_by_tokens(session, 500)
-
-        # A new message was added
-        assert len(session.messages) == original_count + 1
-
-        # Original messages are unchanged (just shifted by the insertion)
-        # The compact summary was inserted, so original messages start at index 1+
-        summary_msgs = [m for m in session.messages if m.get("_compact_summary")]
-        assert len(summary_msgs) == 1
-
-    @pytest.mark.asyncio
-    async def test_multiple_consolidation_rounds_preserve_context(
-        self, session: Session, make_consolidator, sessions: SessionManager
-    ):
-        """Each consolidation round should overwrite previous compact summary, not stack them."""
-        consolidator = make_consolidator(context_window_tokens=500)
-        consolidator._last_session_context = "Round 1 context"
-
-        round_values = [10000, 10000, 100]  # 2 consolidation rounds, then done
-        round_index = [0]
-
-        def mock_estimate(sess):
-            val = round_values[round_index[0]]
-            round_index[0] += 1
-            return (val, "mock")
-
-        context_values = ["Round 1 context", "Round 2 context"]
-        context_index = [0]
-
-        async def mock_consolidate(chunk):
-            ctx = context_values[context_index[0]]
-            context_index[0] += 1
-            consolidator._last_session_context = ctx
-            return "summary"
-
-        with (
-            patch.object(
-                consolidator,
-                "estimate_session_prompt_tokens",
-                side_effect=mock_estimate,
-            ),
-            patch.object(
-                consolidator,
-                "consolidate_messages",
-                new=AsyncMock(side_effect=mock_consolidate),
-            ),
-            patch.object(sessions, "save", new=MagicMock()),
-        ):
-            await consolidator.maybe_consolidate_by_tokens(session, 500)
-
-        # Only one compact summary should exist (latest one)
-        summary_msgs = [m for m in session.messages if m.get("_compact_summary")]
-        assert len(summary_msgs) == 1, (
-            f"Expected exactly 1 summary message, got {len(summary_msgs)}. "
-            "Previous summaries should be removed before injecting new one."
-        )
-        # It should be the latest context
-        assert "Round 2 context" in summary_msgs[0]["content"]
+        assert history[0]["content"] == "[Previous session context]: Some context"

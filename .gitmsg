@@ -1,0 +1,15 @@
+feat(memory): Phase 1 — staging in prompt + staged_boundary foundation
+
+- get_memory_context() now includes STAGING.md (pending-synthesis tier),
+  making consolidation output immediately and cross-session visible.
+- Session gains staged_boundary (idempotency watermark: everything before
+  it is already distilled into STAGING.md) with load-time migration from
+  last_consolidated, persistence in the JSONL metadata line, and pointer
+  adjustment in retain_recent_legal_suffix().
+- Add Session.context_prefix_len() tag-scan: the pinned context prefix is
+  derived from _session_context/_compact_summary tags, not a stored pointer.
+- PLAN_unified_consolidation.md updated to v2: single-pointer model,
+  3-case consolidation dispatch (free-drop / commit+drop / stage-only),
+  /stage command, D1-D10 design decisions.
+
+last_consolidated is retained (deprecated) until the Phase 3 removal.

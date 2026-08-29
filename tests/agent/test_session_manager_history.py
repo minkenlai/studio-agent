@@ -1,4 +1,7 @@
-from nanobot.session.manager import Session
+import json
+from pathlib import Path
+
+from nanobot.session.manager import Session, SessionManager
 
 
 def _assert_no_orphans(history: list[dict]) -> None:
@@ -88,28 +91,43 @@ def test_retain_recent_legal_suffix_keeps_recent_messages():
     assert session.messages[-1]["content"] == "msg9"
 
 
-def test_retain_recent_legal_suffix_adjusts_last_consolidated():
+def test_retain_recent_legal_suffix_adjusts_staged_boundary():
+    """retain drops 6 -> SB shifts down by 6 (recomputed, never above len, never below 0)."""
     session = Session(key="test:trim-cons")
     for i in range(10):
         session.messages.append({"role": "user", "content": f"msg{i}"})
-    session.last_consolidated = 7
+    session.staged_boundary = 7
 
     session.retain_recent_legal_suffix(4)
 
     assert len(session.messages) == 4
-    assert session.last_consolidated == 1
+    assert session.messages[0]["content"] == "msg6"
+    assert session.staged_boundary == 1
+
+
+def test_retain_recent_legal_suffix_sb_never_negative():
+    """If SB would go below 0 after a drop, it clamps to 0."""
+    session = Session(key="test:trim-cons-clamp")
+    for i in range(10):
+        session.messages.append({"role": "user", "content": f"msg{i}"})
+    session.staged_boundary = 3
+
+    session.retain_recent_legal_suffix(4)  # drops 6 > SB
+
+    assert len(session.messages) == 4
+    assert session.staged_boundary == 0
 
 
 def test_retain_recent_legal_suffix_zero_clears_session():
     session = Session(key="test:trim-zero")
     for i in range(10):
         session.messages.append({"role": "user", "content": f"msg{i}"})
-    session.last_consolidated = 5
+    session.staged_boundary = 5
 
     session.retain_recent_legal_suffix(0)
 
     assert session.messages == []
-    assert session.last_consolidated == 0
+    assert session.staged_boundary == 0
 
 
 def test_retain_recent_legal_suffix_keeps_legal_tool_boundary():
@@ -386,3 +404,171 @@ def test_retain_recent_legal_suffix_trims_back_orphan():
 
     history = session.get_history(max_messages=500)
     _assert_no_orphans(history)
+
+
+# --- context_prefix_len tag-scan (pinned prefix) ---
+
+
+def _tag(content: str, legacy: bool = False) -> dict:
+    if legacy:
+        return {"role": "user", "content": content, "_compact_summary": True}
+    return {
+        "role": "user",
+        "content": content,
+        "_session_context": True,
+        "_compact_summary": True,
+    }
+
+
+def test_context_prefix_len_no_tags_is_zero():
+    msgs = [
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    assert Session.context_prefix_len(msgs) == 0
+    assert Session.context_prefix_len([]) == 0
+
+
+def test_context_prefix_len_single_tag_then_user():
+    msgs = [_tag("ctx"), {"role": "user", "content": "u1"}]
+    assert Session.context_prefix_len(msgs) == 1
+
+
+def test_context_prefix_len_three_tags():
+    msgs = [_tag("ctx0"), _tag("ctx1"), _tag("ctx2"), {"role": "user", "content": "u1"}]
+    assert Session.context_prefix_len(msgs) == 3
+
+
+def test_context_prefix_len_legacy_only_tag_counts():
+    msgs = [_tag("ctx", legacy=True), _tag("ctx"), {"role": "user", "content": "u1"}]
+    assert Session.context_prefix_len(msgs) == 2
+
+
+def test_context_prefix_len_stops_at_first_untagged():
+    # A tag after a non-tagged message counts only the leading run.
+    msgs = [
+        _tag("ctx0"),
+        {"role": "user", "content": "u1"},
+        _tag("ctx-orphan"),
+    ]
+    assert Session.context_prefix_len(msgs) == 1
+
+
+# --- get_history tag-scan ---
+
+
+def test_get_history_preserves_leading_dual_tagged_prefix():
+    session = Session(key="test:prefix")
+    session.messages = [
+        _tag("[Previous session context]: old work"),
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+
+    history = session.get_history(max_messages=500)
+
+    assert len(history) == 3
+    assert history[0]["content"].startswith("[Previous session context]")
+    assert history[1]["role"] == "user"
+
+
+def test_get_history_drops_leading_untagged_non_user():
+    """Leading untagged assistant/tool messages are dropped; output starts at first user msg."""
+    session = Session(key="test:lead-drop")
+    session.messages = [
+        {"role": "assistant", "content": "orphan-a"},
+        {"role": "tool", "tool_call_id": "x", "name": "f", "content": "orphan-r"},
+        {"role": "user", "content": "first user"},
+        {"role": "assistant", "content": "a1"},
+    ]
+
+    history = session.get_history(max_messages=500)
+
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "first user"
+
+
+def test_get_history_max_messages_caps_slicing():
+    session = Session(key="test:cap")
+    for i in range(10):
+        session.add_message("user", f"u{i}")
+
+    history = session.get_history(max_messages=4)
+
+    assert len(history) == 4
+    assert [m["content"] for m in history] == ["u6", "u7", "u8", "u9"]
+
+
+def test_get_history_small_window_slices_prefix_out():
+    """The max_messages slice is applied first; a prefix outside the window is not restored."""
+    session = Session(key="test:cap-ctx")
+    session.messages = [
+        _tag("ctx"),
+        {"role": "user", "content": "u0"},
+        {"role": "user", "content": "u1"},
+    ]
+
+    history = session.get_history(max_messages=2)
+
+    # sliced = last 2 = [u0, u1]; no tagged prefix inside the slice
+    assert [m["content"] for m in history] == ["u0", "u1"]
+
+
+# --- D10 load/save migration: last_consolidated -> staged_boundary ---
+
+
+def _write_session_jsonl(tmp_path: Path, key: str, metadata_extra: dict, n_msgs: int = 5) -> Path:
+    mgr = SessionManager(tmp_path)
+    path = mgr._get_session_path(key)
+    lines = [
+        {
+            "_type": "metadata",
+            "key": key,
+            "created_at": "2026-08-01T00:00:00",
+            "updated_at": "2026-08-01T00:00:00",
+            "metadata": {},
+            **metadata_extra,
+        }
+    ]
+    lines += [{"role": "user", "content": f"msg{i}"} for i in range(n_msgs)]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_load_migrates_legacy_last_consolidated(tmp_path):
+    _write_session_jsonl(tmp_path, "t:legacy", {"last_consolidated": 5})
+
+    session = SessionManager(tmp_path)._load("t:legacy")
+
+    assert session.staged_boundary == 5
+    assert len(session.messages) == 5
+
+
+def test_load_staged_boundary_wins_over_legacy(tmp_path):
+    _write_session_jsonl(tmp_path, "t:both", {"staged_boundary": 2, "last_consolidated": 5})
+
+    session = SessionManager(tmp_path)._load("t:both")
+
+    assert session.staged_boundary == 2
+
+
+def test_load_no_pointer_keys_defaults_zero(tmp_path):
+    _write_session_jsonl(tmp_path, "t:none", {})
+
+    session = SessionManager(tmp_path)._load("t:none")
+
+    assert session.staged_boundary == 0
+
+
+def test_save_writes_staged_boundary_not_last_consolidated(tmp_path):
+    mgr = SessionManager(tmp_path)
+    session = Session(key="t:save", staged_boundary=4)
+    for i in range(6):
+        session.add_message("user", f"msg{i}")
+
+    mgr.save(session)
+    first_line = mgr._get_session_path("t:save").read_text(encoding="utf-8").splitlines()[0]
+    meta = json.loads(first_line)
+
+    assert meta["staged_boundary"] == 4
+    assert "last_consolidated" not in meta

@@ -127,6 +127,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     content = "**Available Commands:**\n"
     content += "- `/new`: Start a fresh conversation (clears context)\n"
     content += "- `/compact [N]`: Consolidate history, keeping last N messages (default all)\n"
+    content += "- `/stage [N]`: Stage unstaged messages to memory, keeping last N live (default all; drops nothing)\n"
     content += "- `/help`: Show this help\n"
     content += "- `/status`: Show system status and version\n"
     content += "- `/fallback [n]`: Inspect or set the fallback provider slot index\n"
@@ -353,112 +354,230 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
         except ValueError:
             pass
 
-    # Calculate boundary: keep the last N messages
+    # Unified dispatch (D4), shared with the compact_history tool and the
+    # token-budget auto-consolidation: drop [ctx_end : end_idx] where
+    #   free drop     — end_idx ≤ SB (already staged, no LLM work)
+    #   commit + drop — end_idx >  SB (80% guard + distill fresh [SB:end_idx])
+    # ctx_end = end of the pinned tagged context prefix (tag-scan).
+    from nanobot.session.manager import Session
+
+    ctx_end = Session.context_prefix_len(session.messages)
     end_idx = max(0, len(session.messages) - n_keep)
-    chunk = session.messages[session.last_consolidated : end_idx]
 
     logger.info(
-        "cmd_compact: session=%s, total=%d, last_consolidated=%d, end_idx=%d, chunk_size=%d, n_keep=%d",
+        "cmd_compact: session=%s, total=%d, ctx_end=%d, staged_boundary=%d, end_idx=%d, n_keep=%d",
         session.key,
         len(session.messages),
-        session.last_consolidated,
+        ctx_end,
+        session.staged_boundary,
         end_idx,
-        len(chunk),
         n_keep,
     )
 
-    if not chunk:
-        logger.info("cmd_compact: nothing to consolidate for session {}", session.key)
-        return OutboundMessage(
-            address=ctx.msg.address,
-            content="Nothing to summarize (session is already fully compacted).",
-        )
+    result = await loop.memory_consolidator.consolidate_range(session, end_idx)
 
-    # Use the existing consolidation pipeline
-    summary = await loop.memory_consolidator.archive_messages(chunk)
+    if result.error:
+        return OutboundMessage(address=ctx.msg.address, content=result.error)
 
-    # Replace the chunk with the summary and advance pointer.
-    # The chunk is removed and replaced at its start position so that
-    # get_history() (messages[last_consolidated:]) includes the summary.
-    if summary:
-        summary_msg = {
-            "role": "assistant",
-            "content": summary,
-            "timestamp": datetime.now().isoformat(),
-            "_compact_summary": True,  # Marker for get_history() to preserve
-        }
-        start_idx = session.last_consolidated
-        del session.messages[start_idx:end_idx]
-        session.messages.insert(start_idx, summary_msg)
-        session.last_consolidated = start_idx
-
-        logger.info(
-            "cmd_compact: consolidated %d messages for session %s",
-            len(chunk),
-            session.key,
-        )
-
+    if result.consolidated:
         if n_keep > 0:
             reply = f"✅ Consolidated history, keeping last {n_keep} messages."
         else:
             reply = "✅ Consolidated all history."
-        reply += f"\n\n---\n\n{summary}"
-    else:
-        # Summary generation failed — do NOT advance last_consolidated.
-        # The messages must stay in the session to avoid data loss.
-        # This can happen if the chunk exceeds the model's context window.
-        logger.warning(
-            "cmd_compact: summary generation failed for %d messages in session %s — "
-            "last_consolidated NOT advanced to prevent data loss",
-            len(chunk),
-            session.key,
-        )
-        return OutboundMessage(
-            address=ctx.msg.address,
-            content=f"⚠️ Compact failed: summary generation returned no result for {len(chunk)} messages. "
-            f"Session history preserved. This may happen if the content exceeds the model's context window.",
-        )
+        reply += f"\n\n---\n\n{result.summary}"
+        return OutboundMessage(address=ctx.msg.address, content=reply)
 
-    loop.sessions.save(session)
-
+    # Free drop: [ctx_end:end_idx] was already distilled into STAGING.md
+    # at stage time — reclaimed without any LLM call.
     return OutboundMessage(
         address=ctx.msg.address,
-        content=reply,
+        content=f"✅ Dropped {result.dropped} already-staged message(s), keeping last {n_keep}.",
     )
 
 
 async def cmd_forget(ctx: CommandContext) -> OutboundMessage:
-    """Forget all messages since the last consolidated marker."""
+    """Forget everything after the pinned context prefix (D8).
+
+    ``messages = messages[:ctx_end]``, ``SB = ctx_end``. The staged region is
+    already in STAGING.md, so dropping it is lossless; the fresh tail is
+    intentionally forgotten.
+    """
+    from nanobot.session.manager import Session
+
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
 
-    if session.last_consolidated >= len(session.messages):
-        return OutboundMessage(
-            address=ctx.msg.address,
-            content="Nothing to forget. You are already at the last marker.",
-        )
+    # Serialize with background/token-budget consolidation (F1): the staged
+    # region it reclaims is defined by the same SB this command resets.
+    async with loop.memory_consolidator.get_lock(session.key):
+        ctx_end = Session.context_prefix_len(session.messages)
+        num_forgotten = len(session.messages) - ctx_end
+        session.messages = session.messages[:ctx_end]
+        session.staged_boundary = ctx_end
 
-    num_forgotten = len(session.messages) - session.last_consolidated
-    session.messages = session.messages[: session.last_consolidated]
-    session.last_consolidated = len(session.messages)
-
-    loop.sessions.save(session)
-    loop.sessions.invalidate(session.key)
+        loop.sessions.save(session)
+        loop.sessions.invalidate(session.key)
 
     return OutboundMessage(
         address=ctx.msg.address,
-        content=f"Rewound to last marker. Forgot {num_forgotten} messages.",
+        content=f"Rewound to pinned context. Forgot {num_forgotten} message(s).",
     )
 
 
-async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Start a fresh session."""
+def _pick_stage_boundary(messages: list[dict], sb: int, desired: int) -> int | None:
+    """Pick a legal cut point for advancing SB toward ``desired`` (D5).
+
+    A cut at index k is legal iff no tool-call exchange straddles it — i.e.
+    every tool_call declared in ``messages[:k]`` is resolved there. A later
+    free-drop may reclaim ``[ctx_end : k]``, so the live suffix must start
+    clean.
+
+    Preference order:
+    1. Largest user-turn cut at or below ``desired`` (picker logic).
+    2. Largest legal cut below ``desired`` (``_find_legal_start``-style clamp:
+       stage slightly less, keep more live).
+    3. First legal cut at or above ``desired`` (stage slightly more).
+    Returns None if no legal cut exists above SB (tail is one open exchange).
+    """
+    total = len(messages)
+    desired = min(max(desired, sb), total)
+
+    def balanced(k: int) -> bool:
+        declared: set[str] = set()
+        for i in range(k):
+            msg = messages[i]
+            role = msg.get("role")
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        declared.add(str(tc["id"]))
+            elif role == "tool":
+                tid = msg.get("tool_call_id")
+                if tid:
+                    declared.discard(str(tid))
+        return not declared
+
+    # Backward: largest user-turn cut at or below desired (never scan index total).
+    for u in range(min(desired, total - 1), sb, -1):
+        if messages[u].get("role") == "user" and balanced(u):
+            return u
+    # Backward clamp: largest legal cut below desired.
+    for k in range(min(desired, total) - 1, sb, -1):
+        if balanced(k):
+            return k
+    # Forward: first legal cut at or above desired (stage slightly more).
+    for k in range(max(desired, sb), total + 1):
+        if balanced(k):
+            return k
+    return None
+
+
+async def cmd_stage(ctx: CommandContext) -> OutboundMessage:
+    """Stage the unstaged tail into persistent memory, keeping last N live (D5).
+
+    Runs the consolidation LLM over ``[SB : len-N]``, writes to HISTORY.md and
+    STAGING.md, and advances the staged boundary — **drops nothing**, so the
+    live conversation stays the working context. ``session_context`` is
+    discarded (nothing was dropped; a summary of live msgs would be noise).
+
+    Usage: /stage [N]  (N=0 stages everything not yet staged)
+    """
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    snapshot = session.messages[session.last_consolidated :]
-    session.clear()
-    loop.sessions.save(session)
-    loop.sessions.invalidate(session.key)
+
+    # Parse N from raw input (default 0 = stage everything unstaged)
+    n_keep = 0
+    parts = (ctx.raw or "").split()
+    if len(parts) > 1:
+        try:
+            n_keep = abs(int(parts[1]))
+        except ValueError:
+            pass
+
+    sb = session.staged_boundary
+    desired = len(session.messages) - n_keep
+
+    if desired <= sb:
+        return OutboundMessage(
+            address=ctx.msg.address,
+            content="Nothing to stage (no unstaged messages).",
+        )
+
+    # D5 constraint: SB must never land mid tool-call exchange — a later
+    # free-drop would then cut the live history mid-exchange.
+    new_sb = _pick_stage_boundary(session.messages, sb, desired)
+    if new_sb is None or new_sb <= sb:
+        return OutboundMessage(
+            address=ctx.msg.address,
+            content=(
+                "⚠️ No safe staging boundary found (tail is mid tool-call exchange). "
+                "Try again once the current exchange completes."
+            ),
+        )
+
+    chunk = session.messages[sb:new_sb]
+    logger.info(
+        "cmd_stage: session=%s, total=%d, staged_boundary=%d, desired=%d, new_boundary=%d, chunk_size=%d, n_keep=%d",
+        session.key,
+        len(session.messages),
+        sb,
+        desired,
+        new_sb,
+        len(chunk),
+        n_keep,
+    )
+
+    # Same consolidation pipeline as /compact; session_context is discarded
+    # by design — the live messages are still the context. The boundary pick
+    # runs outside the lock (read-only); the distillation + SB advance are
+    # serialized with background/token-budget consolidation (F1).
+    async with loop.memory_consolidator.get_lock(session.key):
+        summary = await loop.memory_consolidator.archive_messages(chunk)
+
+        if not summary:
+            # Summary generation failed — do NOT advance SB (idempotency: the
+            # same messages stay stageable, nothing is lost or double-staged).
+            logger.warning(
+                "cmd_stage: summary generation failed for %d messages in session %s — "
+                "staged boundary not advanced",
+                len(chunk),
+                session.key,
+            )
+            return OutboundMessage(
+                address=ctx.msg.address,
+                content=f"⚠️ Stage failed: summary generation returned no result for {len(chunk)} messages. "
+                f"Nothing was staged. This may happen if the content exceeds the model's context window.",
+            )
+
+        session.staged_boundary = new_sb
+        loop.sessions.save(session)
+
+    reply = f"✅ Staged {len(chunk)} message(s) to memory (SB → {new_sb}). Nothing dropped."
+    if new_sb != desired:
+        if new_sb > desired:
+            reply += f" (Boundary snapped to a clean cut point; {new_sb - desired} message(s) kept live.)"
+        else:
+            reply += f" (Boundary clamped to a clean cut point; {desired - new_sb} message(s) remain unstaged.)"
+    reply += f"\n\n---\n\n{summary}"
+    return OutboundMessage(address=ctx.msg.address, content=reply)
+
+
+async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+    """Start a fresh session (D8).
+
+    Only the *unstaged* tail ``messages[SB:]`` is archived — the staged region
+    is already in STAGING.md, re-archiving it would duplicate.
+    """
+    loop = ctx.loop
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    # Serialize with background/token-budget consolidation (F1): the archived
+    # tail is defined by SB, which the consolidator may be moving. The
+    # background archive itself runs OUTSIDE the lock (it acquires its own).
+    async with loop.memory_consolidator.get_lock(session.key):
+        snapshot = session.messages[session.staged_boundary :]
+        session.clear()
+        loop.sessions.save(session)
+        loop.sessions.invalidate(session.key)
     if snapshot:
         loop._schedule_background(loop.memory_consolidator.archive_messages(snapshot))
     return OutboundMessage(
@@ -572,6 +691,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/forget", cmd_forget)
     router.exact("/compact", cmd_compact)
+    router.exact("/stage", cmd_stage)
     router.exact("/help", cmd_help)
     router.exact("/status", cmd_status)
     router.exact("/fallback", cmd_fallback)

@@ -59,72 +59,29 @@ class CompactHistoryTool(Tool):
 
         session = self._session_manager.get_or_create(self._session_key)
 
-        # Calculate boundary
+        # Unified dispatch (D4), shared with /compact and the token-budget
+        # auto-consolidation: drop [ctx_end : end_idx] where
+        #   free drop     — end_idx ≤ SB (already staged, no LLM work)
+        #   commit + drop — end_idx >  SB (80% guard + distill fresh [SB:end_idx])
+        # ctx_end = end of the pinned tagged context prefix (tag-scan).
         end_idx = max(0, len(session.messages) - n_keep)
-        chunk = session.messages[session.last_consolidated : end_idx]
 
-        if not chunk:
-            return "Nothing to summarize (session is already fully compacted)."
+        result = await self._consolidator.consolidate_range(session, end_idx)
 
-        # Early guard: if the chunk is too large for the consolidator's context,
-        # reject upfront rather than letting the LLM fail and losing data.
-        from nanobot.utils.helpers import estimate_message_tokens
+        if result.error:
+            return result.error
 
-        chunk_tokens = sum(estimate_message_tokens(m) for m in chunk)
-        consolidator_context = getattr(self._consolidator, "context_window_tokens", None)
-        if isinstance(consolidator_context, int) and consolidator_context > 0:
-            if chunk_tokens > consolidator_context * 0.8:  # 80% threshold
-                logger.warning(
-                    "compact_history: chunk (%d tokens) exceeds consolidator context (%d) — skipping",
-                    chunk_tokens,
-                    consolidator_context,
-                )
-                return (
-                    f"⚠️ Compact failed: {len(chunk)} messages ({chunk_tokens:,} tokens) exceed "
-                    f"the summarizer's context window ({consolidator_context:,}). "
-                    f"Session history preserved. Consider compacting with n_keep > 0 first."
-                )
-
-        # Use the existing consolidation pipeline
-        summary = await self._consolidator.archive_messages(chunk)
-
-        # Replace the chunk with the summary and advance pointer.
-        # The chunk is removed and replaced at its start position so that
-        # get_history() (messages[last_consolidated:]) includes the summary.
-        if summary:
-            from datetime import datetime
-
-            summary_msg = {
-                "role": "assistant",
-                "content": summary,
-                "timestamp": datetime.now().isoformat(),
-                "_compact_summary": True,  # Marker for get_history() to preserve
-            }
-            # Replace chunk [last_consolidated : end_idx] with summary
-            start_idx = session.last_consolidated
-            del session.messages[start_idx:end_idx]
-            session.messages.insert(start_idx, summary_msg)
-            session.last_consolidated = start_idx
-
-            self._session_manager.save(session)
-
+        if result.consolidated:
             if n_keep > 0:
                 reply = f"✅ Consolidated history, keeping last {n_keep} messages."
             else:
                 reply = "✅ Consolidated all history."
-            reply += f"\n\n---\n\n{summary}"
-
+            reply += f"\n\n---\n\n{result.summary}"
             return reply
-        else:
-            # Summary generation failed — do NOT advance last_consolidated.
-            # The messages must stay in the session to avoid data loss.
-            logger.warning(
-                "compact_history: summary failed for %d messages in session %s — "
-                "last_consolidated NOT advanced to prevent data loss",
-                len(chunk),
-                self._session_key,
-            )
-            return (
-                f"⚠️ Compact failed: summary generation returned no result for {len(chunk)} messages. "
-                f"Session history preserved. This may happen if the content exceeds the model's context window."
-            )
+
+        # Free drop: [ctx_end:end_idx] was already distilled into STAGING.md
+        # at stage time — reclaimed without any LLM call.
+        reply = f"✅ Dropped {result.dropped} already-staged message(s), keeping last {n_keep}."
+        if session.staged_boundary > 0:
+            reply += f" ({session.staged_boundary} staged message(s) retained for context.)"
+        return reply

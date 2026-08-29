@@ -20,9 +20,14 @@ class Session:
 
     Stores messages in JSONL format for easy reading and persistence.
 
-    Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    Pointer model (unified consolidation, see PLAN_unified_consolidation.md):
+    - ``staged_boundary``: everything before this index has been distilled into
+      STAGING.md (idempotency watermark).
+    - Pinned context prefix: leading messages tagged ``_session_context`` (or
+      legacy ``_compact_summary``); its length is derived by tag-scan
+      (:meth:`context_prefix_len`), not stored.
+    Messages before the staged boundary are dropped from the list once
+    reclamation runs (consolidation), so the file stays bounded.
     """
 
     key: str  # channel:chat_id
@@ -30,13 +35,35 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    # Index of the first message NOT yet distilled into STAGING.md.
+    # Messages before this index have already been staged (idempotency watermark).
+    staged_boundary: int = 0
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
         msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
         self.messages.append(msg)
         self.updated_at = datetime.now()
+
+    @staticmethod
+    def context_prefix_len(messages: list[dict[str, Any]]) -> int:
+        """Count leading tagged context messages (injected session-context summaries).
+
+        A message counts if it has EITHER tag — all producers set both
+        (``_session_context`` and ``_compact_summary``), so in practice the
+        two tests agree.
+
+        These messages mark the pinned region produced by drops; they are
+        intentional context and stay in the prompt. The count is derived from
+        the tags themselves — no stored pointer is needed for this boundary.
+        """
+        n = 0
+        for msg in messages:
+            if msg.get("_session_context") or msg.get("_compact_summary"):
+                n += 1
+            else:
+                break
+        return n
 
     @staticmethod
     def _find_legal_start(messages: list[dict[str, Any]]) -> int:
@@ -104,17 +131,21 @@ class Session:
         return end
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
-        unconsolidated = self.messages[self.last_consolidated :]
-        sliced = unconsolidated[-max_messages:]
+        """Return session messages for LLM input, aligned to a legal tool-call boundary.
+
+        No pointer skip: everything from index 0 is either pinned context
+        (tagged context prefix produced by drops) or live messages (D9).
+        """
+        active = self.messages
+        sliced = active[-max_messages:]
 
         # Drop leading non-user messages to avoid starting mid-turn when possible.
-        # Exception: preserve compact summary messages (tagged _compact_summary)
-        # and any content that follows them — they are intentional context.
+        # Exception: preserve tagged context messages (_session_context, and
+        # legacy _compact_summary) — the pinned prefix is intentional context.
         if sliced:
             for i, msg in enumerate(sliced):
-                if msg.get("_compact_summary"):
-                    # Compact summary found — keep it and everything after.
+                if msg.get("_session_context") or msg.get("_compact_summary"):
+                    # Tagged context prefix found — keep it and everything after.
                     break
                 elif msg.get("role") == "user":
                     # First user message found — drop leading non-user msgs.
@@ -161,7 +192,7 @@ class Session:
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []
-        self.last_consolidated = 0
+        self.staged_boundary = 0
         self.updated_at = datetime.now()
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
@@ -192,7 +223,7 @@ class Session:
 
         dropped = len(self.messages) - len(retained)
         self.messages = retained
-        self.last_consolidated = max(0, self.last_consolidated - dropped)
+        self.staged_boundary = max(0, self.staged_boundary - dropped)
         self.updated_at = datetime.now()
 
 
@@ -262,7 +293,7 @@ class SessionManager:
             messages = []
             metadata = {}
             created_at = None
-            last_consolidated = 0
+            staged_boundary = 0
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -279,7 +310,13 @@ class SessionManager:
                             if data.get("created_at")
                             else None
                         )
-                        last_consolidated = data.get("last_consolidated", 0)
+                        # Migration (D10): sessions written before unification
+                        # only have last_consolidated. Its staged prefix maps
+                        # directly onto staged_boundary — those messages were
+                        # distilled but never dropped.
+                        staged_boundary = data.get(
+                            "staged_boundary", data.get("last_consolidated", 0)
+                        )
                     else:
                         messages.append(data)
 
@@ -288,7 +325,7 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated,
+                staged_boundary=staged_boundary,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -305,7 +342,7 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated,
+                "staged_boundary": session.staged_boundary,
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
