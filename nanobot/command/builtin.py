@@ -3,10 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import sys
 import traceback
-import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -15,7 +13,8 @@ from nanobot.bus.events import OutboundMessage
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from nanobot.command import CommandContext, CommandRouter
+    from nanobot.command import CommandContext
+    from nanobot.command.router import CommandRouter
 
 
 async def cmd_fallback(ctx: CommandContext) -> OutboundMessage:
@@ -94,7 +93,7 @@ async def cmd_speak(ctx: CommandContext) -> OutboundMessage:
       /speak "Hello world"   — synthesize the given text
       /speak                 — synthesize the last agent message from session
     """
-    from nanobot.config.paths import get_media_dir
+    from nanobot.services.tts_service import TTSService
 
     msg = ctx.msg
     loop = ctx.loop
@@ -102,60 +101,23 @@ async def cmd_speak(ctx: CommandContext) -> OutboundMessage:
     if loop is None:
         return OutboundMessage(address=msg.address, content="Error: agent loop not available.")
 
-    # Get TTS client
-    tts = await loop.get_tts_client()
-    if tts is None:
-        return OutboundMessage(
-            address=msg.address,
-            content="🔇 TTS is not configured. Check `tts.provider` in config.",
-        )
+    tts_service = TTSService(loop)
 
-    # Determine text to speak
-    text = ctx.args.strip()
-    if not text:
-        # Grab last assistant message from session
-        session = ctx.session or loop.sessions.get_or_create(ctx.key)
-        last_asst = ""
-        for m in reversed(session.messages):
-            if m.get("role") == "assistant":
-                last_asst = m.get("content", "")
-                break
-        if not last_asst:
-            return OutboundMessage(
-                address=msg.address,
-                content="No prior agent message found to speak.",
-            )
-        text = last_asst
+    text = ctx.args.strip() or None  # empty string → None triggers last-message fallback
+    ok, result = await tts_service.speak(
+        text=text, session_key=ctx.key if hasattr(ctx, "key") else None, msg_address=msg.address
+    )
 
-    # Strip markdown for cleaner TTS
-    clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    clean = re.sub(r"`([^`]+)`", r"\1", clean)
-    clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", clean)
-    clean = re.sub(r"^#{1,6}\s+", "", clean, flags=re.MULTILINE)
-    clean = re.sub(r"\n{2,}", "\n", clean)
-    clean = clean.strip()
-
-    if not clean:
-        return OutboundMessage(
-            address=msg.address, content="Nothing to speak (empty after cleanup)."
-        )
-
-    # Generate audio file
-    out_dir = get_media_dir(msg.address.channel)
-    filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
-    out_path = out_dir / filename
-
-    ok = await tts.synthesize(clean, out_path)
     if not ok:
         return OutboundMessage(
             address=msg.address,
-            content="🔇 TTS synthesis failed. Check logs for details.",
+            content=f"🔇 TTS failed: {result}",
         )
 
     return OutboundMessage(
         address=msg.address,
         content="",
-        media=[str(out_path)],
+        media=[result],
     )
 
 
@@ -187,7 +149,6 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
 
-    # Get version/commit info if possible
     sha = "unknown"
     branch = "unknown"
     try:
@@ -210,25 +171,18 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     else:
         status += " (Manual)"
 
-    # Uptime
     uptime_s = int(time.time() - getattr(loop, "_start_time", time.time()))
     uptime_str = f"{uptime_s // 60}m {uptime_s % 60}s"
 
-    # Tokens
     usage = loop.get_usage(msg.session_key)
 
-    # Agent / Model info (resolved early for context window calculation)
     agent_id = session.metadata.get("agent", "defaults")
     pinned_profile = msg.metadata.get("agent_profile")
 
-    # Resolve context window tokens from the pinned profile
-    # This is needed because slash commands are dispatched BEFORE _apply_agent_profile runs,
-    # so loop.context_window_tokens may still hold the value from the previous message.
     window = getattr(loop, "context_window_tokens", 64000)
     if pinned_profile:
         profile_limit = None
         try:
-            # Use get_agent to properly handle Pydantic extra fields
             profile_cfg = loop.config.agents.get_agent(pinned_profile)
             profile_limit = getattr(profile_cfg, "context_window_tokens", None)
         except (ValueError, AttributeError):
@@ -243,7 +197,6 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         except Exception:
             window = profile_limit or window
 
-    # Context Estimation
     try:
         context_tokens, _ = loop.memory_consolidator.estimate_session_prompt_tokens(session)
         pct = int(context_tokens / window * 100) if window else 0
@@ -251,10 +204,8 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     except Exception:
         context_str = "unknown"
 
-    # Tasks
     running_tasks = getattr(loop.subagents, "get_running_count", lambda: 0)()
 
-    # When a pinned profile is active, use its provider for model info
     if pinned_profile:
         agent_provider = loop.registry.get_provider(pinned_profile)
     else:
@@ -267,7 +218,6 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         model_name = agent_provider.active_model
         fallbacks = agent_provider.fallback_identifiers
         if len(fallbacks) > 1:
-            # Highlight current position in chain
             chain = []
             for fid in fallbacks:
                 if fid == model_id:
@@ -279,7 +229,6 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             model_info = f"`{model_name}` (`{model_id}`)"
     else:
         model_name = getattr(agent_provider, "get_default_model", lambda: loop.model)()
-        # Try to find if this model corresponds to a named model config
         model_id = "unknown"
         if loop.config and loop.config.models:
             for k, v in loop.config.models.items():
@@ -292,20 +241,18 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     content += f"**Branch:** `{branch}`\n"
     content += f"**Commit:** `{sha}`\n"
     content += f"**PID:** `{os.getpid()}`\n\n"
-
     content += f"**Agent:** `{agent_id}`\n"
     if pinned_profile:
         content += f"**Pinned Profile:** `{pinned_profile}`\n"
     content += f"**Model:** {model_info}\n"
     content += (
         f"**Tokens:** {usage.get('input_tokens', 0):,} in / {usage.get('output_tokens', 0):,} out\n"
+        f"**Context:** {context_str}\n"
+        f"**Session:** {len(session.messages)} messages\n"
+        f"**Tasks:** {running_tasks} active\n"
+        f"**Uptime:** {uptime_str}"
     )
-    content += f"**Context:** {context_str}\n"
-    content += f"**Session:** {len(session.messages)} messages\n"
-    content += f"**Tasks:** {running_tasks} active\n"
-    content += f"**Uptime:** {uptime_str}"
 
-    # Render as text so it looks nice
     return OutboundMessage(address=msg.address, content=content, metadata={"render_as": "text"})
 
 
@@ -341,8 +288,6 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
         )
 
     async def _do_restart():
-        from datetime import datetime
-
         log_file = loop.workspace / "logs" / "lifecycle.log"
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         target = msg.address.to_uri()

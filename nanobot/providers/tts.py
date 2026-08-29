@@ -31,6 +31,12 @@ class TTSClient(ABC):
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+        self._default_ext: str = ".wav"
+
+    @property
+    def output_ext(self) -> str:
+        """File extension produced by this provider."""
+        return self._default_ext
 
     @abstractmethod
     async def synthesize(self, text: str, output_path: Path, voice: str = "alloy") -> bool:
@@ -48,6 +54,7 @@ class OpenAITTProvider(TTSClient):
         self, api_key: str | None = None, api_base: str | None = None, default_voice: str = "alloy"
     ):
         super().__init__(api_key, api_base)
+        self._default_ext = ".mp3"
         self.default_voice = default_voice
         self._client = AsyncOpenAI(api_key=api_key or "no-key", base_url=api_base)
 

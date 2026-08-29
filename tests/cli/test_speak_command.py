@@ -36,6 +36,7 @@ async def test_cmd_speak_with_text():
 
     tts = MagicMock()
     tts.synthesize = AsyncMock(return_value=True)
+    tts.output_ext = ".wav"
 
     loop = MagicMock()
     loop.get_tts_client = AsyncMock(return_value=tts)
@@ -65,15 +66,18 @@ async def test_cmd_speak_no_args_uses_last_assistant():
 
     tts = MagicMock()
     tts.synthesize = AsyncMock(return_value=True)
+    tts.output_ext = ".wav"
 
     loop = MagicMock()
     loop.get_tts_client = AsyncMock(return_value=tts)
 
+    # TTSService.fetch_last_assistant() calls loop.sessions.get_or_create(session_key)
     session = MagicMock()
     session.messages = [
         {"role": "user", "content": "What is AI?"},
         {"role": "assistant", "content": "**AI** is `artificial` intelligence."},
     ]
+    loop.sessions.get_or_create.return_value = session
 
     ctx = _make_ctx("/speak", "", loop=loop, session=session)
 

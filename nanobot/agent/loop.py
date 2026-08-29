@@ -26,6 +26,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.speak import SpeakTool
 from nanobot.agent.tools.task_status import TaskStatusTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import Address, InboundMessage, OutboundMessage
@@ -199,6 +200,7 @@ class AgentLoop:
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
         self.tools.register(CompactHistoryTool(self.memory_consolidator, self.sessions))
+        self.tools.register(SpeakTool(self))
 
     async def _get_transcription_provider(self) -> GroqTranscriptionProvider | None:
         """Lazily initialize the Groq transcription provider from config."""
@@ -456,7 +458,7 @@ class AgentLoop:
         agent_profile: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron", "compact_history"):
+        for name in ("message", "spawn", "cron", "compact_history", "speak"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "message":
