@@ -377,35 +377,49 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     # Use the existing consolidation pipeline
     summary = await loop.memory_consolidator.archive_messages(chunk)
 
-    # Inject the summary as a prefix to the 'kept' messages and advance the pointer
+    # Replace the chunk with the summary and advance pointer.
+    # The chunk is removed and replaced at its start position so that
+    # get_history() (messages[last_consolidated:]) includes the summary.
     if summary:
         summary_msg = {
             "role": "assistant",
             "content": summary,
             "timestamp": datetime.now().isoformat(),
+            "_compact_summary": True,  # Marker for get_history() to preserve
         }
-        session.messages.insert(end_idx, summary_msg)
-        # Set pointer to end_idx so the summary is the first message seen by get_history()
-        session.last_consolidated = end_idx
+        start_idx = session.last_consolidated
+        del session.messages[start_idx:end_idx]
+        session.messages.insert(start_idx, summary_msg)
+        session.last_consolidated = start_idx
+
+        logger.info(
+            "cmd_compact: consolidated %d messages for session %s",
+            len(chunk),
+            session.key,
+        )
+
+        if n_keep > 0:
+            reply = f"✅ Consolidated history, keeping last {n_keep} messages."
+        else:
+            reply = "✅ Consolidated all history."
+        reply += f"\n\n---\n\n{summary}"
     else:
-        # Even if no summary is generated, we mark the chunk as consolidated
-        session.last_consolidated = end_idx
+        # Summary generation failed — do NOT advance last_consolidated.
+        # The messages must stay in the session to avoid data loss.
+        # This can happen if the chunk exceeds the model's context window.
+        logger.warning(
+            "cmd_compact: summary generation failed for %d messages in session %s — "
+            "last_consolidated NOT advanced to prevent data loss",
+            len(chunk),
+            session.key,
+        )
+        return OutboundMessage(
+            address=ctx.msg.address,
+            content=f"⚠️ Compact failed: summary generation returned no result for {len(chunk)} messages. "
+            f"Session history preserved. This may happen if the content exceeds the model's context window.",
+        )
 
     loop.sessions.save(session)
-
-    logger.info(
-        "cmd_compact: consolidated %d messages for session %s",
-        len(chunk),
-        session.key,
-    )
-
-    if n_keep > 0:
-        reply = f"✅ Consolidated history, keeping last {n_keep} messages."
-    else:
-        reply = "✅ Consolidated all history."
-
-    if summary:
-        reply += f"\n\n---\n\n{summary}"
 
     return OutboundMessage(
         address=ctx.msg.address,

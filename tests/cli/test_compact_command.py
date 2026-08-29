@@ -69,8 +69,10 @@ class TestCompactCommand:
         loop.memory_consolidator.archive_messages.assert_called_once()
         archived = loop.memory_consolidator.archive_messages.call_args[0][0]
         assert len(archived) == 20
-        # Summary injected at end_idx, last_consolidated = end_idx so summary is visible in history
-        assert session.last_consolidated == 20
+        # Chunk replaced by summary at start_idx (0), so last_consolidated = 0
+        assert session.last_consolidated == 0
+        assert len(session.messages) == 1  # only the summary remains
+        assert session.messages[0].get("_compact_summary") is True
 
     @pytest.mark.asyncio
     async def test_compact_injects_summary_message(self):
@@ -99,15 +101,16 @@ class TestCompactCommand:
 
         await cmd_compact(ctx)
 
-        # Session should have the original message + the summary
-        assert len(session.messages) == 2
-        summary_msg = session.messages[1]
+        # Chunk [0:1] replaced by summary at position 0
+        assert len(session.messages) == 1  # only the summary remains
+        summary_msg = session.messages[0]
         assert summary_msg["role"] == "assistant"
         assert summary_msg["content"] == summary_text
+        assert summary_msg.get("_compact_summary") is True
 
     @pytest.mark.asyncio
-    async def test_compact_no_summary_does_not_inject(self):
-        """If archive_messages returns None, no summary is injected."""
+    async def test_compact_no_summary_preserves_messages(self):
+        """If archive_messages returns None, messages are preserved and last_consolidated is NOT advanced."""
         from nanobot.command.builtin import cmd_compact
         from nanobot.command.router import CommandContext
 
@@ -129,11 +132,14 @@ class TestCompactCommand:
 
         loop.memory_consolidator.archive_messages = AsyncMock(return_value=None)
 
-        await cmd_compact(ctx)
+        out = await cmd_compact(ctx)
 
-        # Only the original message remains, no summary injected
-        assert len(session.messages) == 1
-        assert session.last_consolidated == 1
+        # Summary failed — messages preserved, last_consolidated NOT advanced
+        assert "failed" in out.content.lower()
+        assert "preserved" in out.content.lower()
+        assert len(session.messages) == 1  # original message still there
+        assert session.messages[0]["content"] == "hello"
+        assert session.last_consolidated == 0  # unchanged
 
     @pytest.mark.asyncio
     async def test_compact_positive_n(self):
@@ -169,7 +175,9 @@ class TestCompactCommand:
 
         archived = loop.memory_consolidator.archive_messages.call_args[0][0]
         assert len(archived) == 10  # 20 - 10 = 10
-        assert session.last_consolidated == 10  # end_idx = 20 - 10, summary visible in history
+        # Chunk [0:10] replaced by summary at start_idx (0), so last_consolidated = 0
+        assert session.last_consolidated == 0
+        assert len(session.messages) == 11  # 1 summary + 10 kept
 
     @pytest.mark.asyncio
     async def test_compact_negative_n_uses_absolute(self):
@@ -205,7 +213,8 @@ class TestCompactCommand:
 
         archived = loop.memory_consolidator.archive_messages.call_args[0][0]
         assert len(archived) == 10  # Same as positive 10
-        assert session.last_consolidated == 10
+        assert session.last_consolidated == 0  # Chunk replaced at start_idx (0)
+        assert len(session.messages) == 11  # 1 summary + 10 kept
 
     @pytest.mark.asyncio
     async def test_compact_nothing_to_summarize(self):
@@ -271,7 +280,9 @@ class TestCompactCommand:
 
         archived = loop.memory_consolidator.archive_messages.call_args[0][0]
         assert len(archived) == 20  # all 20 (default 0)
-        assert session.last_consolidated == 20
+        # Chunk [0:20] replaced by summary at start_idx (0)
+        assert session.last_consolidated == 0
+        assert len(session.messages) == 1  # only the summary remains
 
     @pytest.mark.asyncio
     async def test_compact_respects_last_consolidated(self):
@@ -305,5 +316,9 @@ class TestCompactCommand:
         assert "Summary of the conversation" in out.content
 
         archived = loop.memory_consolidator.archive_messages.call_args[0][0]
-        assert len(archived) == 5  # 20 - 5 = 15, then 15 - 10 = 5
-        assert session.last_consolidated == 15  # end_idx = 20 - 5, summary visible in history
+        assert len(archived) == 5  # chunk = messages[10:15]
+        # Summary replaces messages[10:15] at position 10, so last_consolidated = 10
+        # get_history() returns messages[10:] which includes the summary
+        assert session.last_consolidated == 10
+        assert len(session.messages) == 16  # 10 original + 1 summary + 5 kept
+        assert session.messages[10].get("_compact_summary") is True

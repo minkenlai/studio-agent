@@ -52,6 +52,19 @@ class ExecTool(Tool):
                 "/halt",
             }
         )
+        # Benign null devices: redirects to these are harmless and must not trip
+        # the path-outside-workspace guard (e.g. "cmd 2>/dev/null").
+        self._benign_null_devices = frozenset(
+            {
+                "/dev/null",
+                "/dev/zero",
+                "/dev/full",
+                "/dev/tty",
+                "/dev/stdin",
+                "/dev/stdout",
+                "/dev/stderr",
+            }
+        )
 
     @property
     def name(self) -> str:
@@ -202,7 +215,7 @@ class ExecTool(Tool):
 
             cwd_path = Path(cwd).resolve()
 
-            for raw in self._filter_slash_commands(self._extract_absolute_paths(cmd)):
+            for raw in self._filter_benign_tokens(self._extract_absolute_paths(cmd)):
                 try:
                     expanded = os.path.expandvars(raw.strip())
                     p = Path(expanded).expanduser().resolve()
@@ -224,6 +237,12 @@ class ExecTool(Tool):
         )  # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths
 
-    def _filter_slash_commands(self, paths: list[str]) -> list[str]:
-        """Remove known slash commands from extracted paths to avoid false positives."""
-        return [p for p in paths if p not in self._slash_command_names]
+    def _filter_benign_tokens(self, paths: list[str]) -> list[str]:
+        """Remove known slash commands and benign null devices from extracted paths.
+
+        Both are harmless tokens that the path extractor can mistake for absolute
+        paths (e.g. the redirect in "cmd 2>/dev/null"), which would otherwise trip
+        the path-outside-workspace guard.
+        """
+        benign = self._slash_command_names | self._benign_null_devices
+        return [p for p in paths if p not in benign]

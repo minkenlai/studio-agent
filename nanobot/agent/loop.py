@@ -546,10 +546,20 @@ class AgentLoop:
                 msg += f"**Branch:** `{branch}`\n"
                 msg += f"**Commit:** `{sha}`"
 
-                # Check for pending memory recovery files
+                # Check for pending memory recovery files (top-level payload JSONs only;
+                # ignore sub-dirs like assets/ which may exist even when empty)
                 recovery_dir = self.workspace / "memory" / "recovery"
-                if recovery_dir.exists() and any(recovery_dir.iterdir()):
-                    msg += "\n\n⚠️ **Pending recovery data found** in `memory/recovery/`. I can integrate these files into your history if you'd like."
+                recovery_files = (
+                    sorted(p.name for p in recovery_dir.glob("*.json") if p.is_file())
+                    if recovery_dir.exists()
+                    else []
+                )
+                if recovery_files:
+                    files_list = ", ".join(f"`{name}`" for name in recovery_files)
+                    msg += (
+                        f"\n\n⚠️ **Pending recovery data found** in `memory/recovery/` "
+                        f"({files_list}). I can integrate these files into your history if you'd like."
+                    )
 
                 await self.bus.publish_outbound(
                     OutboundMessage(

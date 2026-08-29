@@ -44,7 +44,7 @@ class TestCompactHistoryBasic:
 
     @pytest.mark.asyncio
     async def test_n_keep_zero_consolidates_all(self, tmp_path: Path) -> None:
-        """n_keep=0 should archive every message from last_consolidated to end."""
+        """n_keep=0 should replace all messages with a single summary."""
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=5)  # 10 messages
         sm.save(session)
@@ -61,20 +61,19 @@ class TestCompactHistoryBasic:
         assert chunk[0]["content"] == "user message 0"
         assert chunk[-1]["content"] == "assistant reply 4"
 
-        # Summary injected at index 0, original messages shifted
+        # Chunk is replaced by summary at position 0
         reloaded = sm.get_or_create("test:compact")
         assert reloaded.last_consolidated == 0
+        assert len(reloaded.messages) == 1  # only the summary remains
         assert reloaded.messages[0]["role"] == "assistant"
         assert reloaded.messages[0]["content"] == "Summary of conversation so far."
-        # Original messages are at indices 1..10
-        assert reloaded.messages[1]["content"] == "user message 0"
-        assert len(reloaded.messages) == 11  # summary + 10 originals
+        assert reloaded.messages[0].get("_compact_summary") is True
 
         assert "Consolidated all history" in result
 
     @pytest.mark.asyncio
     async def test_n_keep_partial(self, tmp_path: Path) -> None:
-        """n_keep=2 should archive all but the last 2 messages."""
+        """n_keep=2 should replace chunk with summary, keeping last 2 messages."""
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=5)  # 10 messages
         sm.save(session)
@@ -90,13 +89,13 @@ class TestCompactHistoryBasic:
         assert chunk[-1]["content"] == "assistant reply 3"
 
         reloaded = sm.get_or_create("test:compact")
-        # Summary injected at index 8 (where end_idx was)
-        assert reloaded.messages[8]["role"] == "assistant"
-        assert reloaded.messages[8]["content"] == "Summary of conversation so far."
-        # Kept messages at the end
-        assert reloaded.messages[9]["content"] == "user message 4"
-        assert reloaded.messages[10]["content"] == "assistant reply 4"
-        assert reloaded.last_consolidated == 8
+        # Chunk [0:8] replaced by summary at index 0, kept msgs follow
+        assert reloaded.messages[0]["content"] == "Summary of conversation so far."
+        assert reloaded.messages[0].get("_compact_summary") is True
+        assert reloaded.messages[1]["content"] == "user message 4"
+        assert reloaded.messages[2]["content"] == "assistant reply 4"
+        assert len(reloaded.messages) == 3  # summary + 2 kept
+        assert reloaded.last_consolidated == 0
 
         assert "keeping last 2 messages" in result
 
@@ -168,7 +167,7 @@ class TestCompactHistorySummaryInjection:
 
     @pytest.mark.asyncio
     async def test_summary_injected_into_session_messages(self, tmp_path: Path) -> None:
-        """The summary message should be inserted into session.messages."""
+        """The summary message should replace the chunk at start position."""
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=3)
         sm.save(session)
@@ -180,9 +179,11 @@ class TestCompactHistorySummaryInjection:
         await tool.execute(n_keep=2)
 
         reloaded = sm.get_or_create("test:compact")
-        # end_idx = 6 - 2 = 4; summary at index 4
-        assert reloaded.messages[4]["content"] == custom_summary
-        assert "timestamp" in reloaded.messages[4]
+        # Chunk [0:4] replaced by summary at index 0, kept msgs at 1,2
+        assert reloaded.messages[0]["content"] == custom_summary
+        assert reloaded.messages[0].get("_compact_summary") is True
+        assert "timestamp" in reloaded.messages[0]
+        assert len(reloaded.messages) == 3  # summary + 2 kept
 
     @pytest.mark.asyncio
     async def test_summary_included_in_tool_result(self, tmp_path: Path) -> None:
@@ -202,7 +203,7 @@ class TestCompactHistorySummaryInjection:
 
     @pytest.mark.asyncio
     async def test_last_consolidated_advanced(self, tmp_path: Path) -> None:
-        """last_consolidated should be set to end_idx after consolidation."""
+        """last_consolidated stays at chunk start after chunk is replaced by summary."""
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=10)  # 20 messages
         session.last_consolidated = 4
@@ -214,8 +215,12 @@ class TestCompactHistorySummaryInjection:
         await tool.execute(n_keep=4)
 
         reloaded = sm.get_or_create("test:compact")
-        # end_idx = 20 - 4 = 16
-        assert reloaded.last_consolidated == 16
+        # Chunk [4:16] replaced by summary at index 4
+        # last_consolidated = 4 (the summary position)
+        assert reloaded.last_consolidated == 4
+        assert reloaded.messages[4].get("_compact_summary") is True
+        # 4 original + 1 summary + 4 kept = 9 messages
+        assert len(reloaded.messages) == 9
 
     @pytest.mark.asyncio
     async def test_get_history_after_compact(self, tmp_path: Path) -> None:
@@ -268,12 +273,10 @@ class TestCompactHistoryArchiveFailure:
         assert "Summary" not in result
 
     @pytest.mark.asyncio
-    async def test_last_consolidated_still_advanced_on_failure(self, tmp_path: Path) -> None:
+    async def test_last_consolidated_not_advanced_on_failure(self, tmp_path: Path) -> None:
         """
-        NOTE: This documents current behavior. last_consolidated advances even
-        when archive_messages returns None. This may be a bug — messages are
-        marked as consolidated without a summary being injected.
-        See code review for compact.py, line 78.
+        When archive_messages returns None (consolidation failure),
+        last_consolidated must NOT advance — messages stay in session to prevent data loss.
         """
         sm = SessionManager(tmp_path)
         session = _make_session(message_pairs=3)
@@ -284,11 +287,13 @@ class TestCompactHistoryArchiveFailure:
         tool = CompactHistoryTool(consolidator, sm)
         tool.set_context(Address.from_uri("test:compact"), "test:compact")
 
-        await tool.execute(n_keep=0)
+        result = await tool.execute(n_keep=0)
 
         reloaded = sm.get_or_create("test:compact")
-        # Current behavior: pointer advances to end_idx even on failure
+        # Pointer stays at 0 — messages preserved
         assert reloaded.last_consolidated == 0
+        assert len(reloaded.messages) == 6  # all original messages intact
+        assert "failed" in result.lower()
 
 
 class TestCompactHistoryRepeatedCalls:

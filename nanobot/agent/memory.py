@@ -352,11 +352,12 @@ class MemoryStore:
         filename = f"raw-{ts_file}.txt"
         recovery_path = self.recovery_dir / filename
 
-        # Create assets dir
-        assets_dir = ensure_dir(self.recovery_dir / "assets")
-
         # Deep copy messages to avoid mutating the original session history
         archived_messages = copy.deepcopy(messages)
+
+        # Assets dir is created lazily — only when audio extraction actually needs it,
+        # so an empty assets/ subdir doesn't linger in recovery/
+        assets_dir: Path | None = None
 
         for msg in archived_messages:
             content = msg.get("content")
@@ -381,6 +382,8 @@ class MemoryStore:
                         header, b64_payload = data_val.split(",", 1)
 
                     # Save binary file
+                    if assets_dir is None:
+                        assets_dir = ensure_dir(self.recovery_dir / "assets")
                     asset_name = f"asset_{uuid4().hex[:12]}.bin"
                     asset_path = assets_dir / asset_name
 

@@ -140,3 +140,50 @@ def test_workspace_path_not_blocked(restricted_tool):
         "cat /home/nanobot/.nanobot/workspace/test.py", "/home/nanobot/.nanobot/workspace"
     )
     assert result is None
+
+
+# ── Benign null-device whitelist tests ───────────────────────────────────
+
+
+def test_stderr_redirect_to_dev_null_not_blocked(restricted_tool):
+    """'cmd 2>/dev/null' must NOT trip the path-outside-workspace guard."""
+    result = restricted_tool._guard_command(
+        "echo hi 2>/dev/null", "/home/nanobot/.nanobot/workspace"
+    )
+    assert result is None, f"2>/dev/null falsely blocked: {result}"
+
+
+def test_stdout_redirect_to_dev_null_not_blocked(restricted_tool):
+    """'cmd >/dev/null' must NOT trip the path-outside-workspace guard."""
+    result = restricted_tool._guard_command(
+        "make build >/dev/null", "/home/nanobot/.nanobot/workspace"
+    )
+    assert result is None, f">/dev/null falsely blocked: {result}"
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/stdin", "/dev/stdout", "/dev/stderr"],
+)
+def test_benign_null_devices_not_blocked(restricted_tool, device):
+    """Redirects to any whitelisted null device must pass the guard."""
+    result = restricted_tool._guard_command(
+        f"echo hi 2>{device}", "/home/nanobot/.nanobot/workspace"
+    )
+    assert result is None, f"{device} falsely blocked: {result}"
+
+
+def test_real_path_still_blocked_alongside_dev_null(restricted_tool):
+    """'cat /tmp/foo 2>/dev/null' — the null device is benign, but /tmp/foo is still blocked."""
+    result = restricted_tool._guard_command(
+        "cat /tmp/foo 2>/dev/null", "/home/nanobot/.nanobot/workspace"
+    )
+    assert result is not None, "/tmp/foo should still be blocked even with 2>/dev/null"
+    assert "path outside working dir" in (result or "").lower()
+
+
+def test_dev_device_not_in_whitelist_still_blocked(restricted_tool):
+    """'/dev/sda' is a real device path (not a null device) and SHOULD be blocked."""
+    result = restricted_tool._guard_command("cat /dev/sda", "/home/nanobot/.nanobot/workspace")
+    assert result is not None, "/dev/sda should be blocked as an absolute path"
+    assert "path outside working dir" in (result or "").lower()

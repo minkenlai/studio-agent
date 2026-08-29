@@ -109,10 +109,18 @@ class Session:
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid starting mid-turn when possible.
-        for i, message in enumerate(sliced):
-            if message.get("role") == "user":
-                sliced = sliced[i:]
-                break
+        # Exception: preserve compact summary messages (tagged _compact_summary)
+        # and any content that follows them — they are intentional context.
+        if sliced:
+            for i, msg in enumerate(sliced):
+                if msg.get("_compact_summary"):
+                    # Compact summary found — keep it and everything after.
+                    break
+                elif msg.get("role") == "user":
+                    # First user message found — drop leading non-user msgs.
+                    sliced = sliced[i:]
+                    break
+            # If no user or summary found, leave sliced as-is (original behavior).
 
         # Some providers reject orphan tool results if the matching assistant
         # tool_calls message fell outside the fixed-size history window.
