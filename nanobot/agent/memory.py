@@ -49,6 +49,12 @@ _SAVE_MEMORY_TOOL = [
                         "type": "string",
                         "description": "New facts, updates, or changes to be added to long-term memory. Use a bulleted list. Do NOT return the entire memory file.",
                     },
+                    "session_context": {
+                        "type": "string",
+                        "description": "A brief one-sentence summary of the current session's ongoing context "
+                        "and working state. Use this to preserve continuity after older messages are dropped. "
+                        "Example: 'Implementing unified session consolidation, Phase 1 Task 1: adding session_context field.'",
+                    },
                 },
                 "required": ["history_entry", "memory_update"],
             },
@@ -194,22 +200,35 @@ class MemoryStore:
         messages: list[dict],
         provider: LLMClient,
         model: str,
-    ) -> str | None:
+    ) -> tuple[str, str | None] | None:
         """Consolidate the provided message chunk into MEMORY.md + HISTORY.md.
 
-        Returns the history_entry summary on success, or None on failure.
+        Returns a tuple of (history_entry, session_context) on success, or None on failure.
+        session_context may be None if the LLM did not provide one.
         """
         if not messages:
             return None
 
         current_memory = self.read_long_term()
+        staging_content = ""
+        if self.staging_file.exists():
+            staging_content = self.staging_file.read_text(encoding="utf-8").strip()
+
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
+## Pending Staging Notes
+{staging_content or "(none)"}
+
 ## Conversation to Process
-{self._format_messages(messages)}"""
+{self._format_messages(messages)}
+
+## Guidance
+- **history_entry**: Start with [YYYY-MM-DD HH:MM]. Include specific details (names, decisions, technical terms) that are useful for future grep searches.
+- **memory_update**: New facts or changes as a bulleted list. Do NOT return the entire memory file.
+- **session_context**: Provide a one-sentence summary of what the user is actively working on RIGHT NOW. This will be injected back into the conversation to maintain continuity after old messages are dropped. Focus on current goals and blockers, not just 'user said hello.' Example: 'Implementing unified session consolidation; Phase 2 Task 1 adds drop-and-inject logic for session context continuity.'"""
 
         chat_messages = [
             {
@@ -229,6 +248,7 @@ class MemoryStore:
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
                 tool_choice=forced,
+                max_tokens=8192,
             )
 
             if response.finish_reason == "error" and _is_tool_choice_unsupported(response.content):
@@ -238,6 +258,7 @@ class MemoryStore:
                     tools=_SAVE_MEMORY_TOOL,
                     model=model,
                     tool_choice="auto",
+                    max_tokens=8192,
                 )
 
             if response.finish_reason == "length":
@@ -280,6 +301,9 @@ class MemoryStore:
 
             entry = _ensure_text(args["history_entry"]).strip()
             update = _ensure_text(args["memory_update"])
+            session_ctx = args.get("session_context") if "session_context" in args else None
+            if session_ctx is not None:
+                session_ctx = _ensure_text(session_ctx).strip() or None
 
             if not entry:
                 logger.warning("Memory consolidation: history_entry is empty")
@@ -298,7 +322,7 @@ class MemoryStore:
             self._consecutive_failures = 0
             logger.info("Memory consolidation done for {} messages", len(messages))
             self._cleanup_wal(wal_path)
-            return entry
+            return (entry, session_ctx)
         except asyncio.CancelledError:
             logger.warning("Memory consolidation cancelled (WAL preserved at {})", wal_path)
             self._fail_or_raw_archive(messages)
@@ -422,6 +446,9 @@ class MemoryConsolidator:
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        # Transient: stores the last session_context from a consolidation
+        # so Phase 2 can inject it as a summary message after dropping old msgs.
+        self._last_session_context: str | None = None
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -431,9 +458,21 @@ class MemoryConsolidator:
         """Archive a selected message chunk into persistent memory.
 
         Returns the history_entry summary on success, or None on failure.
+        If session_context was returned by the consolidation, it is stored in
+        ``self._last_session_context`` for downstream injection (Phase 2).
         """
         messages = await self._transcribe_audio(messages)
-        return await self.store.consolidate(messages, self.provider, self.model)
+        result = await self.store.consolidate(messages, self.provider, self.model)
+        if result is None:
+            return None
+        if isinstance(result, tuple):
+            entry, ctx = result
+            self._last_session_context = ctx
+            return entry
+        # Backward compat: if store.consolidate was mocked/patched to return
+        # a plain truthy value (e.g., True), pass it through.
+        self._last_session_context = None
+        return result
 
     async def _transcribe_audio(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
         """Transcribe audio blocks in messages before memory consolidation."""
@@ -633,6 +672,26 @@ class MemoryConsolidator:
                 if not await self.consolidate_messages(chunk):
                     return
                 session.last_consolidated = end_idx
+
+                # Inject session context summary at the consolidation boundary
+                if self._last_session_context:
+                    # Remove any previous compact summary to avoid stacking
+                    session.messages = [
+                        m for m in session.messages if not m.get("_compact_summary")
+                    ]
+                    summary_msg = {
+                        "role": "user",
+                        "content": f"[Previous session context]: {self._last_session_context}",
+                        "_compact_summary": True,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    session.messages.insert(session.last_consolidated, summary_msg)
+                    logger.info(
+                        "Injected session context summary at boundary {} for session {}",
+                        session.last_consolidated,
+                        session.key,
+                    )
+
                 self.sessions.save(session)
 
                 estimated, source = self.estimate_session_prompt_tokens(session)
