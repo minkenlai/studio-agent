@@ -269,9 +269,22 @@ def set_config_path(path: Path) -> None:
 
 
 def get_config_path() -> Path:
-    """Get the configuration file path."""
+    """Get the configuration file path.
+
+    Resolution order:
+      1. Explicit global (``set_config_path``, e.g. ``--config``).
+      2. Systemd credentials tmpfs: ``$CREDENTIALS_DIRECTORY/config.json``
+         (populated by ``LoadCredential=config.json:<base>``) — same
+         auto-detect pattern as the secrets vault.
+      3. Default: ``~/.nanobot/config.json``.
+    """
     if _current_config_path:
         return _current_config_path
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        path = Path(cred_dir) / "config.json"
+        if path.exists():
+            return path
     return Path.home() / ".nanobot" / "config.json"
 
 

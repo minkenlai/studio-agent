@@ -12,8 +12,19 @@ from nanobot.utils.helpers import ensure_dir
 def get_data_dir() -> Path:
     """Return the instance-level runtime data directory."""
     path = get_config_path().parent
-    # If the config is in a read-only directory (like systemd credentials),
-    # fall back to the default home-based location for data.
+    # Never use the systemd credentials tmpfs as a data root: it is
+    # ephemeral (wiped on stop) and its writability is version-dependent.
+    # Deriving state placement from it would silently relocate runtime
+    # data (cron/media/logs) into RAM on some systemd versions.
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        try:
+            path.relative_to(cred_dir)
+            return ensure_dir(Path.home() / ".nanobot")
+        except ValueError:
+            pass
+    # If the config is in a read-only directory, fall back to the default
+    # home-based location for data.
     if not os.access(path, os.W_OK):
         return ensure_dir(Path.home() / ".nanobot")
     return ensure_dir(path)
