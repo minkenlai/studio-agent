@@ -42,10 +42,173 @@ def get_overlay_path() -> Path | None:
     return None
 
 
+class ConfigOverlayPolicyError(Exception):
+    """Raised when a config overlay violates the base config's overlayPolicy
+    and the policy's ``onViolation`` is ``fail``."""
+
+
+def _get_dotted(node, dotted: str):
+    """Return (found, value) for a dotted path in nested dicts."""
+    cur = node
+    for key in dotted.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return False, None
+        cur = cur[key]
+    return True, cur
+
+
+def _set_dotted_safe(node, dotted: str, value) -> None:
+    """Set a dotted path, creating intermediate dicts as needed."""
+    cur = node
+    keys = dotted.split(".")
+    for key in keys[:-1]:
+        nxt = cur.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[key] = nxt
+        cur = nxt
+    cur[keys[-1]] = value
+
+
+def _deep_merge(base: dict, overlay: dict) -> None:
+    """Recursively merge overlay into base (dicts merged, lists/scalars
+    replaced). Mutates base in place."""
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+
+
+def _policy_value(policy_raw: dict, *names: str):
+    """Read a policy field by any of the given camelCase/snake_case names."""
+    for name in names:
+        if name in policy_raw and policy_raw[name] is not None:
+            return policy_raw[name]
+    return None
+
+
+def _enforce_overlay_policy(base: dict, overlay: dict, policy_raw: dict) -> dict:
+    """Apply an overlay under the base config's overlayPolicy.
+
+    - Only whitelisted top-level sections are applied (deep-merged).
+    - ``overlayPolicy`` itself can never be set by an overlay.
+    - ``deniedPaths`` are frozen: any change to them is rolled back.
+    - ``onViolation``: ``warn`` (default) rejects the offending parts and
+      continues; ``fail`` raises :class:`ConfigOverlayPolicyError`.
+    """
+    allowed = {
+        str(s).lower()
+        for s in (_policy_value(policy_raw, "allowedSections", "allowed_sections") or [])
+    }
+    denied = [
+        str(p) for p in (_policy_value(policy_raw, "deniedPaths", "denied_paths") or []) if str(p)
+    ]
+    on_violation = str(_policy_value(policy_raw, "onViolation", "on_violation") or "warn").lower()
+    if on_violation not in ("warn", "fail"):
+        logger.warning(
+            f"overlayPolicy.onViolation={on_violation!r} is not 'warn'|'fail' — using 'warn'."
+        )
+        on_violation = "warn"
+
+    violations: list[str] = []
+
+    # 1. Filter sections against the whitelist.
+    clean: dict = {}
+    for key, value in overlay.items():
+        if key in ("overlayPolicy", "overlay_policy"):
+            violations.append("'overlayPolicy' may not be set by an overlay")
+        elif key.lower() in allowed:
+            clean[key] = value
+        else:
+            violations.append(f"section {key!r} is not in allowedSections")
+
+    # 2. Snapshot denied paths before merging.
+    snapshots = {}
+    for dotted in denied:
+        found, value = _get_dotted(base, dotted)
+        snapshots[dotted] = ("present", value) if found else ("absent", None)
+
+    # 3. Deep-merge the clean sections.
+    for key, value in clean.items():
+        if not isinstance(value, dict):
+            violations.append(f"section {key!r} must be a JSON object")
+            continue
+        node = base.get(key)
+        if node is None:
+            base[key] = {}
+            node = base[key]
+        if not isinstance(node, dict):
+            violations.append(f"base section {key!r} is not an object; cannot merge")
+            continue
+        _deep_merge(node, value)
+
+    # 4. Enforce frozen paths (roll back any change).
+    for dotted, (state, value) in snapshots.items():
+        found, now = _get_dotted(base, dotted)
+        if state == "absent":
+            if found:
+                violations.append(f"deniedPath {dotted!r} was added by the overlay")
+                _remove_dotted(base, dotted)
+        elif found and now != value:
+            violations.append(f"deniedPath {dotted!r} was modified by the overlay")
+            _restore_dotted(base, dotted, value)
+
+    if violations:
+        message = "Config overlay policy violation: " + "; ".join(violations)
+        if on_violation == "fail":
+            logger.error(f"{message} — refusing to boot (onViolation=fail).")
+            raise ConfigOverlayPolicyError(message)
+        logger.warning(f"{message} — offending parts were not applied (onViolation=warn).")
+
+    logger.info(
+        f"Config overlay applied from {len(clean)}/{len(overlay)} sections "
+        f"(policy: {len(allowed)} allowed, {len(denied)} frozen)."
+    )
+    return base
+
+
+def _restore_dotted(node: dict, dotted: str, value) -> None:
+    """Restore a frozen dotted path to its snapshot value (container-safe)."""
+    keys = dotted.split(".")
+    cur = node
+    for key in keys[:-1]:
+        if not isinstance(cur, dict) or not isinstance(cur.get(key), dict):
+            return
+        cur = cur[key]
+    if isinstance(cur, dict):
+        cur[keys[-1]] = value
+
+
+def _remove_dotted(node: dict, dotted: str) -> None:
+    """Remove a dotted path, pruning containers left empty by the removal."""
+    keys = dotted.split(".")
+    trail: list[dict] = [node]
+    cur = node
+    for key in keys[:-1]:
+        if not isinstance(cur, dict) or key not in cur:
+            return
+        cur = cur[key]
+        trail.append(cur)
+        if not isinstance(cur, dict):
+            return
+    if keys[-1] not in cur:
+        return
+    del cur[keys[-1]]
+    # Prune empty containers bottom-up (never prune the root).
+    for i in range(len(trail) - 1, 0, -1):
+        if trail[i]:
+            break
+        del trail[i - 1][keys[i - 1]]
+
+
 def apply_overlay(base: dict, overlay_path: Path) -> dict:
     """
-    Merge overlay JSON into base config at the section (top-level key) level.
-    Overlay sections replace base sections wholesale — no deep merge.
+    Merge overlay JSON into the base config.
+
+    If the base config carries an ``overlayPolicy``, the overlay is applied
+    under that policy (whitelisted sections deep-merged, denied paths
+    frozen). Without a policy, the legacy section-replace behavior applies.
     """
     if not overlay_path.exists():
         logger.warning(f"Config overlay not found: {overlay_path} — skipping.")
@@ -53,12 +216,19 @@ def apply_overlay(base: dict, overlay_path: Path) -> dict:
     try:
         with open(overlay_path, encoding="utf-8") as f:
             overlay = json.load(f)
-        logger.info(
-            f"Applying config overlay from {overlay_path} (sections: {list(overlay.keys())})"
-        )
-        base.update(overlay)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"Failed to load config overlay from {overlay_path}: {e} — skipping.")
+        return base
+    if not isinstance(overlay, dict):
+        logger.warning(f"Config overlay {overlay_path} is not a JSON object — skipping.")
+        return base
+
+    policy_raw = base.get("overlayPolicy") or base.get("overlay_policy")
+    if isinstance(policy_raw, dict):
+        return _enforce_overlay_policy(base, overlay, policy_raw)
+
+    logger.info(f"Applying config overlay from {overlay_path} (sections: {list(overlay.keys())})")
+    base.update(overlay)
     return base
 
 

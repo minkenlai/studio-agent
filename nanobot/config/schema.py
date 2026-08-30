@@ -273,6 +273,29 @@ def get_default_capabilities() -> dict[str, ModelCapabilities]:
     }
 
 
+class OverlayPolicyConfig(Base):
+    """Policy governing which parts of the config a config overlay may change.
+
+    Only meaningful when a config overlay is active (``--config-overlay`` /
+    ``NANOBOT_CONFIG_OVERLAY``). The policy itself lives in the *base* config
+    (which is operator-owned and unreachable from the agent), so an overlay —
+    which may be agent-writable — can never widen its own authority.
+
+    - ``allowedSections``: top-level sections the overlay may modify (deep-merged).
+      Any other top-level section is rejected.
+    - ``deniedPaths``: dotted paths that must remain unchanged after merging
+      (e.g. ``agents.defaults.workspace`` even when ``agents`` is allowed).
+    - ``onViolation``: ``warn`` (reject the offending parts, boot continues —
+      default) or ``fail`` (refuse to boot).
+    """
+
+    allowed_sections: list[str] = Field(default_factory=list)
+    denied_paths: list[str] = Field(default_factory=list)
+    # "warn" (default) or "fail"; anything else is treated as "warn"
+    # (fail-soft: a policy typo must not brick the whole config load).
+    on_violation: str = "warn"
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -285,6 +308,7 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     repl: ReplConfig = Field(default_factory=ReplConfig)
     frugality: FrugalityConfig = Field(default_factory=FrugalityConfig)
+    overlay_policy: OverlayPolicyConfig = Field(default_factory=OverlayPolicyConfig)
     debug_llm: bool = False  # Log full responses and dump them to files in workspace/logs/llm_dumps
     capabilities: dict[str, ModelCapabilities] = Field(
         default_factory=get_default_capabilities,

@@ -439,6 +439,8 @@ def _load_runtime_config(
 ) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import (
+        ConfigOverlayPolicyError,
+        get_overlay_path,
         load_config,
         set_config_path,
         set_overlay_path,
@@ -462,6 +464,7 @@ def _load_runtime_config(
         set_overlay_path(overlay_path)
         console.print(f"[dim]Using config overlay: {overlay_path}[/dim]")
 
+    secrets_path: Path | None = None
     if secrets:
         secrets_path = Path(secrets).expanduser().resolve()
         if not secrets_path.exists():
@@ -470,11 +473,42 @@ def _load_runtime_config(
         set_secrets_path(secrets_path)
         console.print(f"[dim]Using secrets vault: {secrets_path}[/dim]")
 
-    loaded = load_config(config_path)
+    try:
+        loaded = load_config(config_path)
+    except ConfigOverlayPolicyError as e:
+        console.print(f"[red]Boot refused (overlay policy, onViolation=fail): {e}[/red]")
+        raise typer.Exit(1)
     _warn_deprecated_config_keys(config_path)
     if workspace:
         loaded.agents.defaults.workspace = workspace
+    _log_config_authority(loaded, config_path, get_overlay_path(), secrets_path)
     return loaded
+
+
+def _log_config_authority(
+    config: Config,
+    config_path: Path | None,
+    overlay_path: Path | None,
+    secrets_path: Path | None,
+) -> None:
+    """Audit log: print the effective security-relevant configuration at boot.
+
+    Makes tampered startup inputs (e.g. a compromised EXTRA_ARGS pointing
+    --config/--workspace elsewhere) visible in the boot log: compare against
+    the expected deployment values.
+    """
+    from nanobot.config.loader import get_config_path, get_secrets_path
+
+    def _p(p: Path | None) -> str:
+        return str(p) if p else "(none)"
+
+    vault = get_secrets_path()
+    console.print(
+        f"[dim]authority: config={_p(config_path or get_config_path())} "
+        f"overlay={_p(overlay_path)} vault={_p(vault)} "
+        f"workspace={config.agents.defaults.workspace} "
+        f"restrict_to_workspace={config.tools.restrict_to_workspace}[/dim]"
+    )
 
 
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
