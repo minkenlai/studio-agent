@@ -435,9 +435,15 @@ def _load_runtime_config(
     config: str | None = None,
     workspace: str | None = None,
     config_overlay: str | None = None,
+    secrets: str | None = None,
 ) -> Config:
     """Load config and optionally override the active workspace."""
-    from nanobot.config.loader import load_config, set_config_path, set_overlay_path
+    from nanobot.config.loader import (
+        load_config,
+        set_config_path,
+        set_overlay_path,
+        set_secrets_path,
+    )
 
     config_path = None
     if config:
@@ -455,6 +461,14 @@ def _load_runtime_config(
             raise typer.Exit(1)
         set_overlay_path(overlay_path)
         console.print(f"[dim]Using config overlay: {overlay_path}[/dim]")
+
+    if secrets:
+        secrets_path = Path(secrets).expanduser().resolve()
+        if not secrets_path.exists():
+            console.print(f"[red]Error: Secrets vault not found: {secrets_path}[/red]")
+            raise typer.Exit(1)
+        set_secrets_path(secrets_path)
+        console.print(f"[dim]Using secrets vault: {secrets_path}[/dim]")
 
     loaded = load_config(config_path)
     _warn_deprecated_config_keys(config_path)
@@ -528,6 +542,12 @@ def gateway(
         help="Path to a JSON file that merges additional settings over the base configuration. "
         "Useful for temporary or environment-specific overrides.",
     ),
+    secrets: str | None = typer.Option(
+        None,
+        "--secrets",
+        help="Path to the secrets vault JSON (dotted-path -> value). Overrides auto-detection "
+        "(NANOBOT_SECRETS env / $CREDENTIALS_DIRECTORY).",
+    ),
     agent_name: str | None = typer.Option(
         None,
         "--agent-name",
@@ -554,7 +574,7 @@ def gateway(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    config = _load_runtime_config(config, workspace, config_overlay)
+    config = _load_runtime_config(config, workspace, config_overlay, secrets)
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
@@ -819,6 +839,12 @@ def agent(
         help="Path to a JSON file that merges additional settings over the base configuration. "
         "Useful for temporary or environment-specific overrides.",
     ),
+    secrets: str | None = typer.Option(
+        None,
+        "--secrets",
+        help="Path to the secrets vault JSON (dotted-path -> value). Overrides auto-detection "
+        "(NANOBOT_SECRETS env / $CREDENTIALS_DIRECTORY).",
+    ),
     markdown: bool = typer.Option(
         True,
         "--markdown/--no-markdown",
@@ -848,7 +874,7 @@ def agent(
     from nanobot.bus.queue import MessageBus
     from nanobot.cron.service import CronService
 
-    config = _load_runtime_config(config, workspace, config_overlay)
+    config = _load_runtime_config(config, workspace, config_overlay, secrets)
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
