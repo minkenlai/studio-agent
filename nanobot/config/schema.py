@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -308,7 +308,15 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     repl: ReplConfig = Field(default_factory=ReplConfig)
     frugality: FrugalityConfig = Field(default_factory=FrugalityConfig)
-    overlay_policy: OverlayPolicyConfig = Field(default_factory=OverlayPolicyConfig)
+    # Accept both spellings: the config template is serialized camelCase
+    # (to_camel), but this root is a BaseSettings that does NOT inherit the
+    # alias_generator from Base, so without an explicit alias the camelCase
+    # ``overlayPolicy`` key from disk is rejected as an unknown field
+    # (extra_forbidden) — which silently boots with the DEFAULT config.
+    overlay_policy: OverlayPolicyConfig = Field(
+        default_factory=OverlayPolicyConfig,
+        validation_alias=AliasChoices("overlayPolicy", "overlay_policy"),
+    )
     debug_llm: bool = False  # Log full responses and dump them to files in workspace/logs/llm_dumps
     capabilities: dict[str, ModelCapabilities] = Field(
         default_factory=get_default_capabilities,

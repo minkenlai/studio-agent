@@ -5,6 +5,7 @@ import json
 import pytest
 
 from nanobot.config import loader
+from nanobot.config.schema import Config
 
 
 @pytest.fixture(autouse=True)
@@ -100,6 +101,29 @@ def test_overlay_cannot_set_overlay_policy(tmp_path):
     out = loader.apply_overlay(base, ov)
 
     assert out["overlayPolicy"]["allowedSections"] == ["models", "agents"]
+
+
+def test_base_config_with_camel_case_overlay_policy_validates():
+    """Regression: the deployed template writes ``overlayPolicy`` camelCase.
+
+    The root ``Config`` is a BaseSettings that does NOT inherit the
+    to_camel alias generator from Base, so without an explicit
+    validation_alias the camelCase key is rejected as extra_forbidden and
+    the gateway silently boots with the DEFAULT config.
+    """
+    data = _base(_policy())
+    cfg = Config.model_validate(data)
+
+    assert cfg.overlay_policy.allowed_sections == ["models", "agents"]
+    assert cfg.overlay_policy.denied_paths == ["agents.defaults.workspace"]
+    assert cfg.overlay_policy.on_violation == "warn"
+
+
+def test_base_config_with_snake_case_overlay_policy_validates():
+    data = _base()
+    data["overlay_policy"] = _policy()
+    cfg = Config.model_validate(data)
+    assert cfg.overlay_policy.allowed_sections == ["models", "agents"]
 
 
 def test_denied_path_modification_rolled_back(tmp_path):
