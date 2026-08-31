@@ -34,6 +34,73 @@ from nanobot.providers.factory import AgentRegistry
 _MAX_COMPLETED_RECORDS = 50
 
 
+def explicit_profile_workspace(agents: Any, profile: str | None) -> Path | None:
+    """Return the profile's ``workspace`` if the profile *explicitly set* it.
+
+    ``AgentDefaults`` has a default ``workspace`` value, so comparing against
+    a default is not a reliable override test. ``model_fields_set`` (pydantic
+    v2) contains ``"workspace"`` only when the raw profile config provided
+    the field, which is exactly the override signal we need.
+
+    Returns the raw (expanduser'd, not resolved) ``Path`` or ``None`` when
+    there is no override (no profile, "defaults", unconfigured profile, or
+    field not set). The caller (``resolve_profile_workspace``) joins
+    relative values to the sandbox root and performs the containment check.
+    """
+    if not profile or profile == "defaults":
+        return None
+    try:
+        cfg = agents.get_agent(profile)
+    except Exception:
+        return None
+    if "workspace" not in getattr(cfg, "model_fields_set", ()):
+        return None
+    p = Path(cfg.workspace).expanduser()
+    return p
+
+
+def under_root(path: Path, root: Path) -> bool:
+    """True if ``path`` is ``root`` or anywhere under it (no symlink tricks)."""
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_profile_workspace(
+    root: Path, agents: Any, profile: str | None
+) -> tuple[Path | None, bool]:
+    """Resolve a profile working dir under the sandbox root (Option B).
+
+    A profile ``workspace`` sets the subagent's *working directory* (where
+    relative paths and ``exec`` start), NOT its sandbox: containment stays at
+    ``root``.
+
+    Relative values are interpreted **relative to ``root``** (so
+    ``ws/experimental`` lands in ``<root>/ws/experimental``); absolute and
+    ``~`` values are taken as given. The result is ``resolve()``-d
+    (canonicalizing ``..`` and symlinks) before the containment check.
+
+    Returns ``(workspace, out_of_root)``:
+        - ``(root, False)``  — no override (or override equal to root).
+        - ``(path, False)``  — override inside root; use as working dir.
+        - ``(None, True)``   — override explicitly set but outside root;
+          the caller must reject the spawn (loudly).
+    """
+    if not profile or profile == "defaults":
+        return root, False
+    raw = explicit_profile_workspace(agents, profile)
+    if raw is None:
+        return root, False
+    root_resolved = root.resolve()
+    p = raw if raw.is_absolute() else root_resolved / raw
+    resolved = p.resolve()
+    if not under_root(resolved, root_resolved):
+        return None, True
+    return resolved, False
+
+
 @dataclass
 class TaskRecord:
     """Tracks the lifecycle of a single spawned subagent task."""
@@ -197,7 +264,31 @@ class SubagentManager:
             agent_name,
         )
 
-        log_file = self.workspace / "logs" / f"task-{task_id}.log"
+        # Option B profile workspace: the profile's working dir (relative
+        # paths / exec cwd start here), while the sandbox boundary stays at
+        # self.workspace (the operator root). A profile workspace that
+        # resolves outside the root is rejected — an agent-writable overlay
+        # must not be able to move the containment boundary.
+        working_dir, out_of_root = resolve_profile_workspace(
+            self.workspace, self.config.agents, agent_name
+        )
+        if out_of_root:
+            err = (
+                f"Error: agent profile '{agent_name}' sets workspace "
+                f"'{self.config.agents.get_agent(agent_name).workspace!r}', which "
+                "resolves outside the sandbox root. Profile workspaces must stay "
+                "inside the root; refusing to spawn."
+            )
+            logger.error("Subagent [{}] rejected: profile workspace outside root", task_id)
+            await self._announce_result(
+                task_id, label, task, err, origin, "error", agent_profile=agent_profile
+            )
+            return
+        # Persona files, skills, and task logs stay at the root: the subagent
+        # keeps the shared brain, only its default start point moves.
+        root_ws = self.workspace
+
+        log_file = root_ws / "logs" / f"task-{task_id}.log"
         try:
             log_file.parent.mkdir(parents=True, exist_ok=True)
             with log_file.open("w", encoding="utf-8") as f:
@@ -219,25 +310,29 @@ class SubagentManager:
                 pass
 
         try:
-            # Build subagent tools (no message tool, no spawn tool)
+            # Build subagent tools (no message tool, no spawn tool).
+            # working_dir = profile working dir (start point); allowed_dir /
+            # containment_root = sandbox root (boundary). When the profile
+            # sets no workspace they are the same path (legacy behavior).
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
+            allowed_dir = root_ws if self.restrict_to_workspace else None
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
             tools.register(
                 ReadFileTool(
-                    workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
+                    workspace=working_dir, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
                 )
             )
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(SearchFilesTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            tools.register(WriteFileTool(workspace=working_dir, allowed_dir=allowed_dir))
+            tools.register(EditFileTool(workspace=working_dir, allowed_dir=allowed_dir))
+            tools.register(ListDirTool(workspace=working_dir, allowed_dir=allowed_dir))
+            tools.register(SearchFilesTool(workspace=working_dir, allowed_dir=allowed_dir))
             tools.register(
                 ExecTool(
-                    working_dir=str(self.workspace),
+                    working_dir=str(working_dir),
                     timeout=self.exec_config.timeout,
                     restrict_to_workspace=self.restrict_to_workspace,
                     path_append=self.exec_config.path_append,
+                    containment_root=str(root_ws) if self.restrict_to_workspace else None,
                 )
             )
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
@@ -246,7 +341,9 @@ class SubagentManager:
             # it can use the spawn tool, but it must pass its own agent_profile.
             tools.register(SpawnTool(manager=self, agent_profile=agent_profile))
 
-            system_prompt = self._build_subagent_prompt(context_scope, included_skills)
+            system_prompt = self._build_subagent_prompt(
+                context_scope, included_skills, working_dir=working_dir
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -415,6 +512,7 @@ Result:
         self,
         context_scope: Literal["full", "technical", "minimal"] = "full",
         included_skills: list[str] | None = None,
+        working_dir: Path | None = None,
     ) -> str:
         """Build a focused system prompt for the subagent.
 
@@ -425,6 +523,9 @@ Result:
                 'minimal' = no persona files
             included_skills: Optional whitelist of skill names.
                 If None, all available skills are included.
+            working_dir: Profile working dir (Option B). When it differs from
+                the sandbox root, the prompt states where relative paths and
+                shell commands start.
         """
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
@@ -456,6 +557,16 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 ## Workspace
 {self.workspace}"""
         ]
+
+        # When a profile working dir differs from the sandbox root, tell the
+        # subagent where relative paths start (sandbox boundary unchanged).
+        if working_dir is not None and working_dir != self.workspace:
+            parts.append(
+                "## Working Directory\n"
+                f"Your working directory is `{working_dir}` — relative file paths "
+                f"and shell commands start there. The sandbox boundary remains "
+                f"`{self.workspace}`."
+            )
 
         if core_parts:
             parts.append("## Core Persona & Guidelines\n\n" + "\n\n".join(core_parts))

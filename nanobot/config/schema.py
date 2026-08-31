@@ -49,6 +49,12 @@ class ModelConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
+    # The "defaults" workspace is the sandbox ROOT for the whole process.
+    # For named profiles, workspace is the subagent *working directory*
+    # (Option B): relative values resolve against the root, and the value is
+    # rejected at spawn if it resolves outside the root — see
+    # SubagentManager.resolve_profile_workspace. The containment boundary
+    # itself never moves.
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (

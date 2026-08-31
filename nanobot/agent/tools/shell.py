@@ -23,9 +23,16 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
         path_append: str = "",
+        containment_root: str | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
+        # Containment boundary for the path guard when restrict_to_workspace
+        # is on. Defaults to the working dir (legacy behavior). Subagents with
+        # a profile workspace inside the shared sandbox pass the sandbox root
+        # here so their cwd can sit in a subdirectory without shrinking the
+        # boundary.
+        self.containment_root = containment_root
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",  # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",  # del /f, del /q
@@ -214,6 +221,11 @@ class ExecTool(Tool):
                 return "Error: Command blocked by safety guard (path traversal detected)"
 
             cwd_path = Path(cwd).resolve()
+            root_path = (
+                Path(self.containment_root).expanduser().resolve()
+                if self.containment_root
+                else cwd_path
+            )
 
             for raw in self._filter_benign_tokens(self._extract_absolute_paths(cmd)):
                 try:
@@ -221,7 +233,7 @@ class ExecTool(Tool):
                     p = Path(expanded).expanduser().resolve()
                 except Exception:
                     continue
-                if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
+                if p.is_absolute() and root_path not in p.parents and p != root_path:
                     return "Error: Command blocked by safety guard (path outside working dir)"
 
         return None
