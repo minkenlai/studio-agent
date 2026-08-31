@@ -915,6 +915,62 @@ def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path)
     assert "port 18792" in result.stdout
 
 
+def _invoke_gateway_stdout(monkeypatch) -> str:
+    """Invoke `gateway` (stopped early at _make_provider), return stdout.
+
+    Widen the console so the authority line is not wrapped at terminal
+    width (single-line assertions stay meaningful).
+    """
+    from nanobot.cli import commands
+
+    monkeypatch.setattr(
+        "nanobot.cli.commands._make_provider",
+        lambda *args, **kwargs: (_ for _ in ()).throw(_StopGatewayError("stop")),
+    )
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr(commands.console, "width", 400)
+
+    result = runner.invoke(app, ["gateway"])
+    assert isinstance(result.exception, _StopGatewayError)
+    return result.stdout
+
+
+def test_gateway_authority_line_autodetects_tmpfs_config_and_vault(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """No --config/--secrets flags: authority line must show the paths
+    resolved via auto-detect (flag > env > $CREDENTIALS_DIRECTORY),
+    matching the LoadCredential deployment where ExecStart passes neither."""
+    cred = tmp_path / "run-credentials" / "nanobot.service"
+    cred.mkdir(parents=True)
+    (cred / "config.json").write_text("{}", encoding="utf-8")
+    (cred / "secrets.json").write_text("{}", encoding="utf-8")
+
+    config = Config()
+    monkeypatch.delenv("NANOBOT_SECRETS", raising=False)
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.set_secrets_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.get_config_path", lambda: cred / "config.json")
+    monkeypatch.setattr("nanobot.config.loader.get_secrets_path", lambda: cred / "secrets.json")
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+
+    out = _invoke_gateway_stdout(monkeypatch)
+    assert f"authority: config={cred / 'config.json'}" in out
+    assert f"vault={cred / 'secrets.json'}" in out
+
+
+def test_gateway_workspace_defaults_to_schema_default_without_flag(monkeypatch) -> None:
+    """No --workspace flag: authority line shows the resolved workspace
+    (config key absent -> schema default ~/.nanobot/workspace)."""
+    config = Config()
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+
+    out = _invoke_gateway_stdout(monkeypatch)
+    expected = str(Path.home() / ".nanobot" / "workspace")
+    assert f"workspace={expected}" in out
+
+
 def test_channels_login_requires_channel_name() -> None:
     result = runner.invoke(app, ["channels", "login"])
 

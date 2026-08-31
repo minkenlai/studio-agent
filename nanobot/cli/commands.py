@@ -502,11 +502,13 @@ def _log_config_authority(
     def _p(p: Path | None) -> str:
         return str(p) if p else "(none)"
 
-    vault = get_secrets_path()
+    # Mirror the config handling: explicit caller value first, then
+    # auto-detect (flag > NANOBOT_SECRETS > credentials tmpfs).
+    vault = secrets_path or get_secrets_path()
     console.print(
         f"[dim]authority: config={_p(config_path or get_config_path())} "
         f"overlay={_p(overlay_path)} vault={_p(vault)} "
-        f"workspace={config.agents.defaults.workspace} "
+        f"workspace={config.workspace_path} "
         f"restrict_to_workspace={config.tools.restrict_to_workspace}[/dim]"
     )
 
