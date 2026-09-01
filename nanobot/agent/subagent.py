@@ -287,6 +287,23 @@ class SubagentManager:
         # Persona files, skills, and task logs stay at the root: the subagent
         # keeps the shared brain, only its default start point moves.
         root_ws = self.workspace
+        # The profile working dir may not exist yet. It is guaranteed to be
+        # inside the root (checked above), so creating it is benign — and it
+        # makes the exec cwd available from the first shell call instead of
+        # failing with "No such file or directory" until some write happens
+        # to create the dir.
+        try:
+            working_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # E.g. a regular file already occupies the path. Fall back to the
+            # root working dir rather than crashing the background task.
+            logger.warning(
+                "Subagent [{}] could not create working dir {}: {} — using root",
+                task_id,
+                working_dir,
+                e,
+            )
+            working_dir = root_ws
 
         log_file = root_ws / "logs" / f"task-{task_id}.log"
         try:

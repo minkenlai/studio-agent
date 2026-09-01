@@ -271,6 +271,17 @@ class TestSubagentWiring:
         assert mocks["ExecTool"].call_args.kwargs["working_dir"] == str(root)
 
     @pytest.mark.asyncio
+    async def test_missing_working_dir_is_created(self, env):
+        manager, mocks, root, runner = env
+        # fresh dir that does not exist yet
+        fresh = (root / "ws" / "fresh").resolve()
+        assert not (root / "ws" / "fresh").exists()
+        manager.config.agents = _agents(freshws={"model": "m", "workspace": "ws/fresh"})
+        await self._spawn(manager, "freshws")
+        assert fresh.exists() and fresh.is_dir()
+        assert mocks["ExecTool"].call_args.kwargs["working_dir"] == str(fresh)
+
+    @pytest.mark.asyncio
     async def test_out_of_root_profile_is_rejected(self, env):
         manager, mocks, root, runner = env
         await self._spawn(manager, "evil")
