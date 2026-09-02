@@ -837,6 +837,33 @@ class MemoryConsolidator:
                 return entry
         return None
 
+    def _log_consolidation_stats(
+        self,
+        session: Session,
+        before: int,
+        after: int,
+        dropped: int,
+        maxed_out: bool = False,
+    ) -> None:
+        """One line summarizing a pressure-driven consolidation run.
+
+        Gives an auditable record of how much context was compressed away
+        (tokens before/after, messages dropped) and how much remains.
+        """
+        reduction = int((before - after) / before * 100) if before else 0
+        suffix = " (max consolidation rounds used)" if maxed_out else ""
+        logger.info(
+            "Token-budget consolidation done for session {}: {:,} -> {:,} tokens "
+            "(-{}%), {} messages dropped, {} messages remain{}",
+            session.key,
+            before,
+            after,
+            reduction,
+            dropped,
+            len(session.messages) - Session.context_prefix_len(session.messages),
+            suffix,
+        )
+
     async def maybe_consolidate_by_tokens(
         self, session: Session, context_window_tokens: int
     ) -> None:
@@ -861,8 +888,22 @@ class MemoryConsolidator:
             if estimated < budget:
                 return
 
+            before = estimated
+            dropped_total = 0
+            logger.info(
+                "Token budget pressure: session {} est. {:,} tokens >= budget {:,} "
+                "(window {:,}) — consolidating toward target {:,} [est. source: {}]",
+                session.key,
+                before,
+                budget,
+                context_window_tokens,
+                target,
+                source,
+            )
+
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
                 if estimated <= target:
+                    self._log_consolidation_stats(session, before, estimated, dropped_total)
                     return
 
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
@@ -894,6 +935,15 @@ class MemoryConsolidator:
                     )
                     return
 
+                dropped_total += result.dropped
                 estimated, source = self.estimate_session_prompt_tokens(session)
                 if estimated <= 0:
                     return
+
+            # Loop finished without reaching the target early: all rounds were
+            # used up (or the picker found nothing left to reclaim). Report
+            # the outcome either way so the stats line always exists.
+            if estimated > target:
+                self._log_consolidation_stats(
+                    session, before, estimated, dropped_total, maxed_out=True
+                )

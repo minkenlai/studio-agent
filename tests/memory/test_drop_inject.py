@@ -381,3 +381,72 @@ class TestDropAndInject:
             "Compact summary message should be preserved in get_history() output"
         )
         assert history[0]["content"] == "[Previous session context]: Some context"
+
+
+class TestConsolidationStatsLine:
+    """The token-budget path emits an auditable stats line (before/after tokens,
+    messages dropped/remaining) so auto-compactions are inspectable post-hoc."""
+
+    class _Recorder:
+        def __init__(self):
+            self.messages: list[str] = []
+
+        def _record(self, level, msg, *args, **kwargs):
+            try:
+                text = msg.format(*args) if args else msg
+            except Exception:
+                text = msg
+            self.messages.append(text)
+
+        def info(self, msg, *args, **kwargs):
+            self._record("info", msg, *args)
+
+        def warning(self, msg, *args, **kwargs):
+            self._record("warning", msg, *args)
+
+        def debug(self, msg, *args, **kwargs):
+            self._record("debug", msg, *args)
+
+        def error(self, msg, *args, **kwargs):
+            self._record("error", msg, *args)
+
+    @pytest.mark.asyncio
+    async def test_stats_line_logged_on_pressure_consolidation(
+        self,
+        session: Session,
+        make_consolidator,
+        sessions: SessionManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from nanobot.agent import memory as memory_mod
+
+        recorder = self._Recorder()
+        monkeypatch.setattr(memory_mod, "logger", recorder)
+
+        consolidator = make_consolidator(context_window_tokens=6400)
+        estimates = iter([(10000, "mock"), (100, "mock")])
+        with (
+            patch.object(
+                consolidator,
+                "estimate_session_prompt_tokens",
+                side_effect=lambda s: next(estimates),
+            ),
+            patch.object(
+                consolidator,
+                "consolidate_messages",
+                new=AsyncMock(return_value=("summary", "ctx")),
+            ),
+            patch.object(sessions, "save", new=MagicMock()),
+        ):
+            await consolidator.maybe_consolidate_by_tokens(session, 6400)
+
+        pressure = [m for m in recorder.messages if "Token budget pressure" in m]
+        stats = [m for m in recorder.messages if "Token-budget consolidation done" in m]
+        assert len(pressure) == 1
+        assert "10,000" in pressure[0]
+        assert len(stats) == 1
+        # 10,000 -> 100 tokens (-99%); picker reclaimed all 8 -> 2 remain
+        assert "10,000 -> 100 tokens" in stats[0]
+        assert "-99%" in stats[0]
+        assert "6 messages dropped" in stats[0]
+        assert "2 messages remain" in stats[0]
