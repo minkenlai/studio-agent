@@ -26,6 +26,7 @@ from telegram import (
     Update,
     User,
 )
+from telegram.constants import ReactionEmoji
 from telegram.error import BadRequest, InvalidToken, NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import BaseRequest, HTTPXRequest
@@ -49,6 +50,48 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 # boundary so the final rendered message never overflows.
 TELEGRAM_HTML_MAX_LEN = 4096
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+
+TELEGRAM_ALLOWED_REACTIONS: frozenset[str] = frozenset(
+    str(getattr(ReactionEmoji, a)) for a in dir(ReactionEmoji) if a.isupper()
+)
+
+TELEGRAM_REACTION_FALLBACKS: dict[str, str] = {
+    # Checkmarks and acknowledgments -> Thumbs up / Saluting face
+    "✅": "👍",
+    "✔️": "👍",
+    "☑️": "👍",
+    "🆗": "👍",
+    # Celebrations and boosts
+    "🚀": "🔥",
+    "⭐": "🔥",
+    "🌟": "🔥",
+    "💡": "⚡",
+    "🎯": "🏆",
+    # Greetings
+    "👋": "🤝",
+    # Denials and warnings
+    "❌": "👎",
+    "🚫": "👎",
+    "🛑": "👎",
+}
+
+
+def normalize_telegram_reaction(emoji: str) -> str:
+    """Normalize an emoji to a Telegram-supported reaction emoji."""
+    cleaned = emoji.strip()
+    if cleaned in TELEGRAM_ALLOWED_REACTIONS:
+        return cleaned
+
+    stripped_vs = cleaned.replace("\ufe0f", "")
+    if stripped_vs in TELEGRAM_ALLOWED_REACTIONS:
+        return stripped_vs
+
+    if mapped := TELEGRAM_REACTION_FALLBACKS.get(cleaned):
+        return mapped
+    if mapped := TELEGRAM_REACTION_FALLBACKS.get(stripped_vs):
+        return mapped
+
+    return "👍"
 
 # python-telegram-bot exposes a six-parameter Application generic. Nanobot
 # doesn't customize its context/data/job-queue types, so keep that SDK boundary
@@ -2040,6 +2083,7 @@ class TelegramChannel(BaseChannel):
                 sender_id=sender_id,
                 text=content,
                 guide_cfg=self.config.guide_bot,
+                metadata=metadata,
             )
             return
 
@@ -2077,6 +2121,7 @@ class TelegramChannel(BaseChannel):
         sender_id: str,
         text: str,
         guide_cfg: TelegramGuideBotConfig,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Forward public Telegram Guide message to isolated Guide Node API instance via HTTP SSE."""
         import json
@@ -2091,7 +2136,8 @@ class TelegramChannel(BaseChannel):
             "stream": True,
         }
 
-        guide_meta = {"bot_identity": "guide", "node_type": "guide"}
+        guide_meta = dict(metadata or {})
+        guide_meta.update({"bot_identity": "guide", "node_type": "guide"})
         self.logger.info("[Telegram Routing] Forwarding Guide message from {} (session {}) to {}", sender_id, session_key, guide_cfg.guide_instance_url)
         self._start_typing(chat_id, metadata=guide_meta, is_guide=True)
         try:
@@ -2156,7 +2202,7 @@ class TelegramChannel(BaseChannel):
                             channel=self.name,
                             chat_id=chat_id,
                             content=reply_text,
-                            metadata={"bot_identity": "guide", "node_type": "guide"},
+                            metadata=guide_meta,
                         )
                         await self.send(outbound)
                     else:
@@ -2233,16 +2279,26 @@ class TelegramChannel(BaseChannel):
         """Add emoji reaction to a message (best-effort, non-blocking)."""
         if not self._app or not emoji:
             return
+        target_emoji = normalize_telegram_reaction(emoji)
         try:
             bot = self._get_bot(chat_id, metadata=metadata, is_guide=is_guide)
             target_chat_id = self._parse_chat_id(chat_id)
             await bot.set_message_reaction(
                 chat_id=target_chat_id,
                 message_id=message_id,
-                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                reaction=[ReactionTypeEmoji(emoji=target_emoji)],
             )
         except Exception as e:
-            self.logger.debug("reaction failed: {}", e)
+            self.logger.warning(
+                "[Telegram Reaction] Reaction '{}' (normalized from '{}') failed for chat {}: {}",
+                target_emoji,
+                emoji,
+                chat_id,
+                e,
+            )
+            # If setting the reaction fails (e.g. group chat reaction limits/permissions),
+            # remove any temporary thinking reaction (eyes) so it doesn't remain stuck.
+            await self._remove_reaction(chat_id, message_id, metadata=metadata, is_guide=is_guide)
 
     async def _remove_reaction(
         self,

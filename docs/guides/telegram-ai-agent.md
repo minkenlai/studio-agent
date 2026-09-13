@@ -115,7 +115,7 @@ workspace as your local CLI check.
 When participating in group chats where the bot should remain quiet unless explicitly addressed, prompt instructions alone can lead to accidental conversational chatter. The Telegram channel supports deterministic, zero-noise silence protocols:
 
 - **`[SILENT]`** (or `[NONE]`, `[NO_REPLY]`, `[NOOP]`): The gateway immediately cancels the typing indicator, removes any temporary thinking reaction (such as `reactEmoji`), and sends **zero text** to the chat. Emitting negative reaction tokens like `[REACTION: none]` or `[REACTION: silent]` also triggers this behavior.
-- **`[REACTION: <emoji>]`**: The gateway cancels typing and applies the specified emoji reaction to the user's triggering message via Telegram's `setMessageReaction` API, sending **zero text** to the chat. Supports Unicode emojis (e.g. `[REACTION: ✅]`) and common shortcodes (e.g. `[REACTION: :thumbsup:]`).
+- **`[REACTION: <emoji>]`**: The gateway cancels typing and applies the specified emoji reaction to the user's triggering message via Telegram's `setMessageReaction` API, sending **zero text** to the chat. Supports Telegram-allowed emojis (e.g. `👍`, `🫡`, `🔥`, `👌`, `⚡`, `💯`, `❤️`). Popular non-whitelisted emojis (such as `✅`, `✔️`, `🚀`) are automatically mapped to supported equivalents (`👍`, `🔥`), with safe fallback to `👍`. If reaction permissions fail in a group, any temporary thinking emoji (`reactEmoji`) is cleanly removed.
 
 Any trailing text following a silent ack token is automatically truncated to guarantee zero noise in group chats.
 
@@ -125,7 +125,7 @@ Any trailing text following a silent ack token is automatically truncated to gua
 ## Silence Protocol
 If a message in this group chat is not directed to you or requires no action:
 - Respond with `[SILENT]` to remain completely quiet.
-- Respond with `[REACTION: <emoji>]` (e.g. `[REACTION: ✅]`) to acknowledge receipt without posting text.
+- Respond with `[REACTION: <emoji>]` (e.g. `[REACTION: 👍]` or `[REACTION: 🫡]`) to acknowledge receipt without posting text.
 Do not output any additional commentary.
 ```
 

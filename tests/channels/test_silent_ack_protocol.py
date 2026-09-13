@@ -92,13 +92,13 @@ async def test_telegram_channel_silent_ack_reaction() -> None:
     )
     await chan.send(msg)
 
-    # Verify reaction added, typing stopped, no text sent
+    # Verify reaction added (normalized from ✅ to 👍 for Telegram compatibility), typing stopped, no text sent
     chan._stop_typing.assert_called_once_with("12345", metadata=msg.metadata)
     mock_bot.set_message_reaction.assert_called_once()
     assert mock_bot.set_message_reaction.call_args.kwargs["message_id"] == 999
     reaction_arg = mock_bot.set_message_reaction.call_args.kwargs["reaction"]
     assert len(reaction_arg) == 1
-    assert reaction_arg[0].emoji == "✅"
+    assert reaction_arg[0].emoji == "👍"
     mock_bot.send_message.assert_not_called()
 
 
@@ -246,7 +246,7 @@ async def test_telegram_channel_silent_ack_edge_cases() -> None:
     await chan.send(msg_empty)
     mock_bot.send_message.assert_not_called()
 
-    # 3. Exception in set_message_reaction should be suppressed, zero text sent
+    # 3. Exception in set_message_reaction should fall back to _remove_reaction, zero text sent
     msg_err = OutboundMessage(
         channel="telegram",
         chat_id="12345",
@@ -254,8 +254,36 @@ async def test_telegram_channel_silent_ack_edge_cases() -> None:
         metadata={"message_id": "111"},
     )
     await chan.send(msg_err)
-    mock_bot.set_message_reaction.assert_called_once()
+    # Called twice: 1st with reaction=[👍] (raised), 2nd with reaction=[] (defensive cleanup)
+    assert mock_bot.set_message_reaction.call_count == 2
+    assert mock_bot.set_message_reaction.call_args.kwargs["reaction"] == []
     mock_bot.send_message.assert_not_called()
+
+
+def test_telegram_emoji_normalization() -> None:
+    from nanobot.channels.telegram.runtime import normalize_telegram_reaction
+
+    # 1. Standard supported emojis stay untouched
+    assert normalize_telegram_reaction("👍") == "👍"
+    assert normalize_telegram_reaction("🔥") == "🔥"
+    assert normalize_telegram_reaction("🫡") == "🫡"
+    assert normalize_telegram_reaction("🦄") == "🦄"
+
+    # 2. Checkmarks and common unsupported tokens map to 👍
+    assert normalize_telegram_reaction("✅") == "👍"
+    assert normalize_telegram_reaction("✔️") == "👍"
+    assert normalize_telegram_reaction("☑️") == "👍"
+    assert normalize_telegram_reaction("🆗") == "👍"
+
+    # 3. Celebrations map to 🔥
+    assert normalize_telegram_reaction("🚀") == "🔥"
+    assert normalize_telegram_reaction("⭐") == "🔥"
+
+    # 4. Variation selector stripping
+    assert normalize_telegram_reaction("❤️") == "❤"
+
+    # 5. Unknown unsupported emoji falls back to 👍
+    assert normalize_telegram_reaction("🍕") == "👍"
 
 
 @pytest.mark.asyncio
