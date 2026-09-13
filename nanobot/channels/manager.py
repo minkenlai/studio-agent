@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import inspect
 from collections import OrderedDict
@@ -33,6 +34,7 @@ from nanobot.channels.contracts import (
     channel_runtime_name,
     resolve_channel_action_target,
 )
+from nanobot.channels.protocol import SilentAckStreamGate
 from nanobot.channels.registry import channel_default_enabled
 from nanobot.config.schema import Config
 from nanobot.utils.restart import (
@@ -153,6 +155,7 @@ class ChannelManager:
         self._stopping_channels: set[str] = set()
         self._started = False
         self._origin_reply_fingerprints: OrderedDict[tuple[str, str, str], str] = OrderedDict()
+        self._stream_gate = SilentAckStreamGate()
 
         self._init_channels()
 
@@ -987,8 +990,7 @@ class ChannelManager:
             **kwargs,
         )
 
-    @staticmethod
-    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
+    async def _send_once(self, channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
         event = msg.event
         if isinstance(event, ProgressEvent) and event.reasoning_end:
@@ -1006,10 +1008,40 @@ class ChannelManager:
                 msg.metadata,
             )
         elif isinstance(event, StreamDeltaEvent):
-            await ChannelManager._send_stream_event(channel, msg, event)
+            gate = getattr(self, "_stream_gate", None)
+            if gate is not None:
+                is_suppressed, to_flush = gate.process_delta(
+                    msg.channel, msg.chat_id, event.stream_id, msg.content
+                )
+                if to_flush:
+                    flushed_content = "".join(to_flush)
+                    flushed_event = dataclasses.replace(event, content=flushed_content)
+                    flushed_msg = replace_outbound_event(msg, flushed_event, content=flushed_content)
+                    await ChannelManager._send_stream_event(channel, flushed_msg, flushed_event)
+                elif not is_suppressed:
+                    pass  # buffering waiting for token or closing bracket
+            else:
+                await ChannelManager._send_stream_event(channel, msg, event)
         elif isinstance(event, StreamEndEvent):
-            await ChannelManager._send_stream_event(channel, msg, event)
-        elif not isinstance(event, StreamedResponseEvent):
+            gate = getattr(self, "_stream_gate", None)
+            if gate is not None:
+                is_suppressed, to_flush = gate.process_end(
+                    msg.channel, msg.chat_id, event.stream_id
+                )
+                if to_flush:
+                    flushed_content = "".join(to_flush)
+                    flushed_delta = StreamDeltaEvent(content=flushed_content, stream_id=event.stream_id)
+                    flushed_msg = replace_outbound_event(msg, flushed_delta, content=flushed_content)
+                    await ChannelManager._send_stream_event(channel, flushed_msg, flushed_delta)
+                if not is_suppressed:
+                    await ChannelManager._send_stream_event(channel, msg, event)
+            else:
+                await ChannelManager._send_stream_event(channel, msg, event)
+        elif isinstance(event, StreamedResponseEvent):
+            gate = getattr(self, "_stream_gate", None)
+            if gate is not None and gate.check_and_consume_chat_suppressed(msg.channel, msg.chat_id):
+                await channel.send(msg)
+        else:
             await channel.send(msg)
 
     def _coalesce_stream_deltas(

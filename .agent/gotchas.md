@@ -52,5 +52,6 @@ When an agent participates in group chats (such as Telegram or WhatsApp) where i
 - **Do NOT rely solely on system prompt instructions** for silence, as chatty LLMs may chime in, send empty quotes, or trigger tool-call loops trying to "stay quiet".
 - **Silent Ack Signals**: Instruct the agent to reply with `[SILENT]` (or `[NONE]`, `[NO_REPLY]`, `[NOOP]`, `[REACTION: none]`, `[REACTION: silent]`) or `[REACTION: <emoji>]` (e.g. `[REACTION: ✅]`).
 - **Channel Delivery Interception**: The Telegram and WhatsApp runtimes intercept these tokens, cancel typing indicators, clear temporary thinking reactions (or set the requested emoji reaction via platform API), and send **zero text** to the chat.
+- **Streaming Gating**: When streaming is enabled on a channel, `ChannelManager` automatically gates the stream prefix via `SilentAckStreamGate` (`nanobot/channels/protocol.py`), preventing premature message bubbles and routing the final suppressed turn to `channel.send(msg)`.
 - **Noise Truncation**: Any commentary trailing a silent ack token is automatically discarded at the protocol parser level (`nanobot/channels/protocol.py`).
 

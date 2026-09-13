@@ -291,3 +291,160 @@ async def test_whatsapp_channel_silent_ack_edge_cases() -> None:
     # Should suppress exception and not send text
     await chan.send(msg_reaction)
     mock_client_err.send_message.assert_not_called()
+
+
+def test_silent_ack_stream_gate_unit() -> None:
+    from nanobot.channels.protocol import SilentAckStreamGate
+
+    gate = SilentAckStreamGate(max_buffer_len=30)
+
+    # 1. Normal response: starts with non-bracket text -> immediate release on chunk 1
+    suppressed, flushed = gate.process_delta("tg", "chat1", "s1", "Hello")
+    assert not suppressed
+    assert flushed == ["Hello"]
+
+    suppressed, flushed = gate.process_delta("tg", "chat1", "s1", " world!")
+    assert not suppressed
+    assert flushed == [" world!"]
+
+    suppressed, flushed = gate.process_end("tg", "chat1", "s1")
+    assert not suppressed
+    assert flushed == []
+    assert not gate.check_and_consume_chat_suppressed("tg", "chat1")
+
+    # 2. Silent ack token streamed in multiple chunks: [REACTION: 🚀]
+    suppressed, flushed = gate.process_delta("tg", "chat2", "s2", "[REAC")
+    assert not suppressed
+    assert flushed == []  # Buffering
+
+    suppressed, flushed = gate.process_delta("tg", "chat2", "s2", "TION: ")
+    assert not suppressed
+    assert flushed == []  # Buffering
+
+    suppressed, flushed = gate.process_delta("tg", "chat2", "s2", "🚀]")
+    assert suppressed  # Detected silent ack token!
+    assert flushed == []
+
+    # Subsequent chunks in the same stream must be suppressed
+    suppressed, flushed = gate.process_delta("tg", "chat2", "s2", " trailing chatter")
+    assert suppressed
+    assert flushed == []
+
+    suppressed, flushed = gate.process_end("tg", "chat2", "s2")
+    assert suppressed
+    assert flushed == []
+    # Chat must be marked as suppressed for the final StreamedResponseEvent
+    assert gate.check_and_consume_chat_suppressed("tg", "chat2")
+    # Single-use: consuming again should return False
+    assert not gate.check_and_consume_chat_suppressed("tg", "chat2")
+
+    # 3. Bracketed non-token: [1] Source note
+    suppressed, flushed = gate.process_delta("tg", "chat3", "s3", "[1] Source")
+    assert not suppressed
+    assert flushed == ["[1] Source"]  # Released because ']' closed and it's not a silent token
+
+    # 4. Long bracketed string without closing bracket: exceeds max_buffer_len
+    gate2 = SilentAckStreamGate(max_buffer_len=15)
+    suppressed, flushed = gate2.process_delta("tg", "chat4", "s4", "[very long open")
+    assert not suppressed
+    assert flushed == ["[very long open"]  # Flushed due to length
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_stream_gate_integration() -> None:
+    from nanobot.bus.outbound_events import (
+        StreamDeltaEvent,
+        StreamedResponseEvent,
+        StreamEndEvent,
+    )
+    from nanobot.channels.manager import ChannelManager
+    from nanobot.config.schema import Config
+
+    config = Config()
+    bus = MessageBus()
+    manager = ChannelManager(config=config, bus=bus)
+
+    mock_channel = MagicMock()
+    mock_channel.name = "telegram"
+    mock_channel.send = AsyncMock()
+    mock_channel.send_delta = AsyncMock()
+
+    # --- Scenario A: Streamed Silent Ack Token ---
+    # 1. First delta: [REACTION:
+    msg1 = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="[REACTION: ",
+        event=StreamDeltaEvent(content="[REACTION: ", stream_id="str1"),
+    )
+    await manager._send_once(mock_channel, msg1)
+    # Must NOT call send_delta (buffered)
+    mock_channel.send_delta.assert_not_called()
+
+    # 2. Second delta: ✅]
+    msg2 = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="✅]",
+        event=StreamDeltaEvent(content="✅]", stream_id="str1"),
+    )
+    await manager._send_once(mock_channel, msg2)
+    # Must NOT call send_delta (suppressed)
+    mock_channel.send_delta.assert_not_called()
+
+    # 3. StreamEndEvent
+    msg_end = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="",
+        event=StreamEndEvent(stream_id="str1"),
+    )
+    await manager._send_once(mock_channel, msg_end)
+    # Must NOT call send_delta for stream end
+    mock_channel.send_delta.assert_not_called()
+
+    # 4. StreamedResponseEvent: final turn delivery
+    msg_final = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="[REACTION: ✅]",
+        event=StreamedResponseEvent(),
+        metadata={"message_id": "42"},
+    )
+    await manager._send_once(mock_channel, msg_final)
+    # Stream was suppressed, so ChannelManager MUST route to mock_channel.send()!
+    mock_channel.send.assert_called_once_with(msg_final)
+
+    # --- Scenario B: Normal Text Stream ---
+    mock_channel.send.reset_mock()
+    mock_channel.send_delta.reset_mock()
+
+    msg_norm1 = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="Hello!",
+        event=StreamDeltaEvent(content="Hello!", stream_id="str2"),
+    )
+    await manager._send_once(mock_channel, msg_norm1)
+    mock_channel.send_delta.assert_called_once()
+    assert mock_channel.send_delta.call_args.args[1] == "Hello!"
+
+    msg_norm_end = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="",
+        event=StreamEndEvent(stream_id="str2"),
+    )
+    await manager._send_once(mock_channel, msg_norm_end)
+    assert mock_channel.send_delta.call_count == 2
+    assert mock_channel.send_delta.call_args.kwargs["stream_end"] is True
+
+    msg_norm_final = OutboundMessage(
+        channel="telegram",
+        chat_id="g100",
+        content="Hello!",
+        event=StreamedResponseEvent(),
+    )
+    await manager._send_once(mock_channel, msg_norm_final)
+    # Normal stream: StreamedResponseEvent must NOT call channel.send()
+    mock_channel.send.assert_not_called()
