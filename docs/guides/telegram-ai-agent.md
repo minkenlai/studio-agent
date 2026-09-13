@@ -110,6 +110,25 @@ nanobot agent -m "/pairing approve ABCD-EFGH"
 Send the message again after approval. The reply should use the same model and
 workspace as your local CLI check.
 
+## Group Silence Protocol & Reactions
+
+When participating in group chats where the bot should remain quiet unless explicitly addressed, prompt instructions alone can lead to accidental conversational chatter. The Telegram channel supports deterministic, zero-noise silence protocols:
+
+- **`[SILENT]`** (or `[NONE]`, `[NO_REPLY]`, `[NOOP]`): The gateway immediately cancels the typing indicator, removes any temporary thinking reaction (such as `reactEmoji`), and sends **zero text** to the chat. Emitting negative reaction tokens like `[REACTION: none]` or `[REACTION: silent]` also triggers this behavior.
+- **`[REACTION: <emoji>]`**: The gateway cancels typing and applies the specified emoji reaction to the user's triggering message via Telegram's `setMessageReaction` API, sending **zero text** to the chat. Supports Unicode emojis (e.g. `[REACTION: ✅]`) and common shortcodes (e.g. `[REACTION: :thumbsup:]`).
+
+Any trailing text following a silent ack token is automatically truncated to guarantee zero noise in group chats.
+
+### Example System Prompt for Group Chats
+
+```markdown
+## Silence Protocol
+If a message in this group chat is not directed to you or requires no action:
+- Respond with `[SILENT]` to remain completely quiet.
+- Respond with `[REACTION: <emoji>]` (e.g. `[REACTION: ✅]`) to acknowledge receipt without posting text.
+Do not output any additional commentary.
+```
+
 ## Security notes
 
 - Prefer pairing-only mode for first setup. Add `allowFrom` only when you want a

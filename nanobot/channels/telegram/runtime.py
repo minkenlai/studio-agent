@@ -34,6 +34,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.protocol import parse_silent_ack
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
@@ -1126,6 +1127,37 @@ class TelegramChannel(BaseChannel):
             return
 
         progress_event = msg.event if isinstance(msg.event, ProgressEvent) else None
+
+        # Check for silent ack protocol ([REACTION: <emoji>] or [SILENT])
+        silent_signal = parse_silent_ack(msg.content)
+        if silent_signal.action != "text":
+            self._stop_typing(msg.chat_id, metadata=msg.metadata)
+            if reply_to_message_id := msg.metadata.get("message_id"):
+                with suppress(ValueError, TypeError):
+                    target_msg_id = int(reply_to_message_id)
+                    is_guide = bool(msg.metadata.get("is_guide", False))
+                    if silent_signal.action == "reaction" and silent_signal.emoji:
+                        await self._add_reaction(
+                            msg.chat_id,
+                            target_msg_id,
+                            silent_signal.emoji,
+                            metadata=msg.metadata,
+                            is_guide=is_guide,
+                        )
+                    else:
+                        await self._remove_reaction(
+                            msg.chat_id,
+                            target_msg_id,
+                            metadata=msg.metadata,
+                            is_guide=is_guide,
+                        )
+            self.logger.info(
+                "[Silent Ack] {} handled for chat {} (trigger msg_id: {})",
+                silent_signal.action.upper(),
+                msg.chat_id,
+                msg.metadata.get("message_id"),
+            )
+            return
 
         # Only stop typing indicator and remove reaction for final responses
         if progress_event is None:

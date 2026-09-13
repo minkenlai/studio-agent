@@ -22,6 +22,7 @@ from pydantic import Field
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.protocol import parse_silent_ack
 from nanobot.config.paths import get_media_dir, get_runtime_subdir
 from nanobot.config.schema import Base
 from nanobot.security.network import PinnedDNSAsyncTransport
@@ -468,6 +469,30 @@ class WhatsAppChannel(BaseChannel):
             raise RuntimeError("WhatsApp channel is not connected")
 
         to = self._build_jid(msg.chat_id)
+
+        # Check for silent ack protocol ([REACTION: <emoji>] or [SILENT])
+        silent_signal = parse_silent_ack(msg.content)
+        if silent_signal.action != "text":
+            with suppress(Exception):
+                await self._send_chat_presence(to, composing=False)
+
+            if silent_signal.action == "reaction" and silent_signal.emoji:
+                target_msg_id = msg.metadata.get("message_id")
+                if target_msg_id:
+                    with suppress(Exception):
+                        send_reaction: Any = getattr(client, "send_reaction", None)
+                        if callable(send_reaction):
+                            reaction_call = send_reaction(to, str(target_msg_id), silent_signal.emoji)
+                            if asyncio.iscoroutine(reaction_call):
+                                await reaction_call
+            self.logger.info(
+                "[Silent Ack] {} handled for WhatsApp chat {} (trigger msg_id: {})",
+                silent_signal.action.upper(),
+                msg.chat_id,
+                msg.metadata.get("message_id"),
+            )
+            return
+
         if msg.content:
             await client.send_message(to, msg.content)
 

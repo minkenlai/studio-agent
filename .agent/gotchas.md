@@ -46,3 +46,11 @@ When registering new slash commands in `nanobot/command/builtin.py` (e.g. `route
 - **Staff Policy Allowlist**: If `StaffPolicy` is enabled with `allowed_commands`, ensure any user-facing command (e.g. `/hints`, `/guide`) is added to the allowlist or documented.
 - **WebUI Lifecycle**: Specify `BuiltinCommandSpec(..., lifecycle=...)` properly (`side_channel`, `finalize_active_turn`, `stop_active_turn`, or `agent_turn`).
 
+## Group Silence Protocol & Reactions
+
+When an agent participates in group chats (such as Telegram or WhatsApp) where it should remain silent unless explicitly addressed:
+- **Do NOT rely solely on system prompt instructions** for silence, as chatty LLMs may chime in, send empty quotes, or trigger tool-call loops trying to "stay quiet".
+- **Silent Ack Signals**: Instruct the agent to reply with `[SILENT]` (or `[NONE]`, `[NO_REPLY]`, `[NOOP]`, `[REACTION: none]`, `[REACTION: silent]`) or `[REACTION: <emoji>]` (e.g. `[REACTION: ✅]`).
+- **Channel Delivery Interception**: The Telegram and WhatsApp runtimes intercept these tokens, cancel typing indicators, clear temporary thinking reactions (or set the requested emoji reaction via platform API), and send **zero text** to the chat.
+- **Noise Truncation**: Any commentary trailing a silent ack token is automatically discarded at the protocol parser level (`nanobot/channels/protocol.py`).
+

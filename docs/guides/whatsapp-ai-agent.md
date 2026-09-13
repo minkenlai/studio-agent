@@ -81,6 +81,13 @@ nanobot agent -m "/pairing approve ABCD-EFGH"
 Send the message again after approval. The reply should use the same model and
 workspace as your local CLI check.
 
+## Group Silence Protocol & Reactions
+
+When the bot participates in WhatsApp group chats with open or broad access, it supports the deterministic silent ack protocol:
+
+- **`[SILENT]`** (or `[NONE]`, `[NO_REPLY]`, `[NOOP]`): Clears typing presence (`composing=False`) and sends **zero text** to the chat. Emitting `[REACTION: none]` or `[REACTION: silent]` also triggers this behavior.
+- **`[REACTION: <emoji>]`**: Clears typing presence, sends an emoji reaction to the triggering message if supported by the linked WhatsApp client, and sends **zero text** to the chat.
+
 ## Security notes
 
 - Treat the WhatsApp session database as account access.
