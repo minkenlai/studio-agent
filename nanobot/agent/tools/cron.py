@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
@@ -28,7 +29,7 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message or command."
     ),
     message=StringSchema(
-        "REQUIRED when action='add' (unless command or skill_name is provided). "
+        "REQUIRED when action='add' (unless command, skill_name, or workflow_id is provided). "
         "Instruction for the agent to execute when the job triggers as an LLM agent turn "
         "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
         "Not used for action='list' or action='remove'."
@@ -36,6 +37,11 @@ _CRON_PARAMETERS = tool_parameters_schema(
     command=StringSchema(
         "Optional shell command to execute deterministically without invoking the LLM "
         "(e.g., 'python scripts/check_health.py')."
+    ),
+    workflow_id=StringSchema(
+        "Optional workflow ID to execute deterministically without invoking the LLM (e.g. 'morning_triage'). "
+        "Recurring schedules update the workflow definition's trigger (single source of truth), "
+        "while one-shot schedules ('at') register an ephemeral run that automatically deletes after completion."
     ),
     skill_name=StringSchema(
         "Optional skill name for executing a pre-approved skill script deterministically "
@@ -93,7 +99,8 @@ _CRON_PARAMETERS = tool_parameters_schema(
     required=["action"],
     description=(
         "Action-specific parameters: add requires a schedule (every_seconds, cron_expr, or at) "
-        "plus one of: message (for agent turn), command (for shell command), or "
+        "plus one of: message (for agent turn), command (for shell command), "
+        "workflow_id (for deterministic workflow execution), or "
         "skill_name + script_name (for skill script); remove requires job_id; list only needs action. "
         "Per-action requirements are enforced at runtime (see field descriptions) so the "
         "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
@@ -106,10 +113,26 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
+    def __init__(
+        self,
+        cron_service: CronService,
+        default_timezone: str = "UTC",
+        workflow_service: Any | None = None,
+        workspace: str | Path | None = None,
+    ):
         self._cron = cron_service
         self._default_timezone = default_timezone
+        self._workflow_service = workflow_service
+        self._workspace = workspace
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
+
+    def _get_workflow_service(self) -> Any:
+        if self._workflow_service is None:
+            from nanobot.workflow.service import WorkflowService
+
+            workflows_dir = (Path(self._workspace) / "workflows") if self._workspace else None
+            self._workflow_service = WorkflowService(workflows_dir, cron_service=self._cron)
+        return self._workflow_service
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
@@ -120,7 +143,28 @@ class CronTool(Tool):
         cron_service = ctx.cron_service
         if cron_service is None:
             raise RuntimeError("CronTool requires an initialized cron service")
-        return cls(cron_service=cron_service, default_timezone=ctx.timezone)
+        workspace = Path(ctx.workspace) if ctx.workspace else None
+        workflows_dir = (workspace / "workflows") if workspace else None
+        agent_ctrl = getattr(ctx, "runtime_control", None)
+        loop_obj = (
+            getattr(ctx, "agent_loop", None)
+            or getattr(agent_ctrl, "_AgentRuntimeControl__target", None)
+            or getattr(agent_ctrl, "target", None)
+            or getattr(agent_ctrl, "agent_loop", None)
+        )
+        wf_service = None
+        try:
+            from nanobot.workflow.service import WorkflowService
+
+            wf_service = WorkflowService(workflows_dir, agent_loop=loop_obj, cron_service=cron_service)
+        except Exception:
+            pass
+        return cls(
+            cron_service=cron_service,
+            default_timezone=ctx.timezone,
+            workflow_service=wf_service,
+            workspace=workspace,
+        )
 
     @staticmethod
     def _request_route() -> tuple[str, str, str, dict[str, Any]]:
@@ -180,11 +224,12 @@ class CronTool(Tool):
         if action == "add":
             has_message = bool(str(params.get("message") or "").strip())
             has_command = bool(str(params.get("command") or "").strip())
+            has_workflow = bool(str(params.get("workflow_id") or "").strip())
             skill_name = str(params.get("skill_name") or "").strip()
             script_name = str(params.get("script_name") or "").strip()
             has_skill = bool(skill_name and script_name)
 
-            if not (has_message or has_command or has_skill):
+            if not (has_message or has_command or has_skill or has_workflow):
                 errors.append("message is required when action='add'")
             if (skill_name and not script_name) or (script_name and not skill_name):
                 errors.append("both 'skill_name' and 'script_name' are required when scheduling a skill script")
@@ -217,6 +262,7 @@ class CronTool(Tool):
         direct: bool = False,
         record_session: bool = True,
         quiet: bool = False,
+        workflow_id: str | None = None,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
@@ -238,6 +284,7 @@ class CronTool(Tool):
                 direct=direct,
                 record_session=record_session,
                 quiet=quiet,
+                workflow_id=workflow_id,
             )
         elif action == "list":
             return self._list_jobs()
@@ -263,11 +310,13 @@ class CronTool(Tool):
         direct: bool = False,
         record_session: bool = True,
         quiet: bool = False,
+        workflow_id: str | None = None,
     ) -> str:
         command_clean = (command or "").strip()
         skill_clean = (skill_name or "").strip()
         script_clean = (script_name or "").strip()
         msg_clean = (message or "").strip()
+        wf_clean = (workflow_id or "").strip()
         target_channel = (channel or "").strip() or None
         target_chat_id = (chat_id or "").strip() or None
         target_thread_id = (thread_id or "").strip() or None
@@ -275,8 +324,11 @@ class CronTool(Tool):
         from typing import Literal
 
         if direct and msg_clean:
-            kind: Literal["agent_turn", "exec_command", "skill_script", "direct_message"] = "direct_message"
+            kind: Literal["agent_turn", "exec_command", "skill_script", "direct_message", "workflow"] = "direct_message"
             default_name = f"msg: {msg_clean[:25]}"
+        elif wf_clean:
+            kind = "workflow"
+            default_name = f"workflow: {wf_clean}"
         elif command_clean:
             kind = "exec_command"
             default_name = f"exec: {command_clean[:24]}"
@@ -290,8 +342,41 @@ class CronTool(Tool):
             return ToolResult.error(
                 "Error: cron action='add' requires a non-empty 'message' parameter "
                 "describing what to do when the job triggers (e.g. the reminder text), "
-                "or 'command', or 'skill_name' + 'script_name'. Retry including message=\"...\"."
+                "or 'command', or 'workflow_id', or 'skill_name' + 'script_name'. Retry including message=\"...\"."
             )
+
+        # If scheduling a workflow, validate existence and apply SSOT for recurring
+        if wf_clean:
+            try:
+                wf_service = self._get_workflow_service()
+                wf = wf_service.get_workflow(wf_clean)
+                if wf is None:
+                    return ToolResult.error(f"Error: workflow '{wf_clean}' not found")
+            except Exception as exc:
+                return ToolResult.error(f"Error checking workflow '{wf_clean}': {exc}")
+
+            if cron_expr or every_seconds:
+                effective_cron = cron_expr
+                if not effective_cron and every_seconds:
+                    if every_seconds % 60 == 0:
+                        mins = every_seconds // 60
+                        effective_cron = f"*/{mins} * * * *" if mins < 60 else "0 * * * *"
+                    else:
+                        return ToolResult.error(
+                            "Error: workflow cron schedules require minute resolution "
+                            "(e.g. cron_expr='*/15 * * * *' or every_seconds divisible by 60)."
+                        )
+                effective_tz = tz or self._default_timezone
+                if err := self._validate_timezone(effective_tz):
+                    return err
+                from nanobot.workflow.schema import TriggerConfig
+
+                wf.trigger = TriggerConfig(cron=effective_cron, tz=effective_tz, enabled=True)
+                wf_service.save_workflow(wf)
+                return (
+                    f"Workflow '{wf_clean}' recurring schedule set to '{effective_cron}' ({effective_tz}). "
+                    "Updated workflow trigger definition as single source of truth (SSOT) and synchronized system cron."
+                )
 
         session_key, origin_channel, origin_chat_id, origin_metadata = self._request_route()
         if not session_key or not origin_channel or not origin_chat_id:
@@ -331,7 +416,7 @@ class CronTool(Tool):
         job = self._cron.add_job(
             name=name or default_name,
             schedule=schedule,
-            message=msg_clean,
+            message=msg_clean or wf_clean,
             delete_after_run=delete_after,
             session_key=session_key,
             origin_channel=origin_channel,
@@ -341,6 +426,7 @@ class CronTool(Tool):
             command=command_clean or None,
             skill_name=skill_clean or None,
             script_name=script_clean or None,
+            workflow_id=wf_clean or None,
             args=args or [],
             quiet=quiet,
             target_channel=target_channel,
@@ -348,6 +434,11 @@ class CronTool(Tool):
             target_thread_id=target_thread_id,
             record_session=record_session,
         )
+        if kind == "workflow":
+            return (
+                f"Scheduled one-shot deterministic run for workflow '{wf_clean}' at {at} (job ID: {job.id}). "
+                "Will execute deterministically without invoking the LLM and delete automatically after run."
+            )
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _format_timing(self, schedule: CronSchedule) -> str:
@@ -401,6 +492,9 @@ class CronTool(Tool):
             if j.payload.kind == "system_event":
                 parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
+            elif j.payload.kind == "workflow":
+                wf_target = j.payload.workflow_id or j.payload.message
+                parts.append(f"  Workflow: {wf_target} (deterministic execution)")
             elif j.payload.kind == "direct_message":
                 parts.append(f"  Direct Message: {j.payload.message}")
             elif j.payload.kind == "exec_command":
@@ -425,11 +519,25 @@ class CronTool(Tool):
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return ToolResult.error("Error: job_id is required for remove")
-        result = self._cron.remove_job(job_id)
+        target_id = job_id
+        if not self._cron.get_job(target_id) and self._cron.get_job(f"workflow:{target_id}"):
+            target_id = f"workflow:{target_id}"
+        if target_id.startswith("workflow:"):
+            wf_id = target_id.removeprefix("workflow:")
+            try:
+                wf_service = self._get_workflow_service()
+                wf = wf_service.get_workflow(wf_id)
+                if wf and wf.trigger:
+                    wf.trigger = None
+                    wf_service.save_workflow(wf)
+                    return f"Removed schedule for workflow '{wf_id}'."
+            except Exception:
+                pass
+        result = self._cron.remove_job(target_id)
         if result == "removed":
-            return f"Removed job {job_id}"
+            return f"Removed job {target_id}"
         if result == "protected":
-            job = self._cron.get_job(job_id)
+            job = self._cron.get_job(target_id)
             if job and job.name == "dream":
                 return (
                     "Cannot remove job `dream`.\n"
@@ -437,7 +545,7 @@ class CronTool(Tool):
                     "It remains visible so you can inspect it, but it cannot be removed."
                 )
             return (
-                f"Cannot remove job `{job_id}`.\n"
+                f"Cannot remove job `{target_id}`.\n"
                 "This is a protected system-managed cron job."
             )
-        return f"Job {job_id} not found"
+        return f"Job {target_id} not found"

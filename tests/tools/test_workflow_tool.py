@@ -147,3 +147,72 @@ async def test_manage_workflow_tool_validate(tmp_path: Path) -> None:
     res_saved_val = await tool.execute(action="validate", workflow_id="valid_flow")
     assert "Workflow 'valid_flow' is valid" in str(res_saved_val)
 
+
+@pytest.mark.asyncio
+async def test_manage_workflow_tool_schedule(tmp_path: Path) -> None:
+    service = WorkflowService(workflows_dir=tmp_path / "workflows")
+    tool = ManageWorkflowTool(service=service)
+
+    # 1. Error if workflow does not exist
+    res_err = await tool.execute(action="schedule", workflow_id="missing", cron="0 9 * * *")
+    assert "Workflow 'missing' not found" in str(res_err)
+
+    # 2. Save a basic workflow
+    wf_dict = {
+        "id": "scheduled_flow",
+        "name": "Scheduled Flow",
+        "start_at": "done",
+        "states": {"done": {"type": "succeed"}},
+    }
+    await tool.execute(action="save", workflow_id="scheduled_flow", definition=wf_dict)
+
+    # 3. Schedule with cron expression and timezone
+    res_sched = await tool.execute(
+        action="schedule",
+        workflow_id="scheduled_flow",
+        cron="*/15 * * * *",
+        tz="America/New_York",
+    )
+    assert "recurring schedule set to '*/15 * * * *' (America/New_York)" in str(res_sched)
+
+    wf = service.get_workflow("scheduled_flow")
+    assert wf is not None
+    assert wf.trigger is not None
+    assert wf.trigger.cron == "*/15 * * * *"
+    assert wf.trigger.tz == "America/New_York"
+    assert wf.trigger.enabled is True
+
+    # 4. Disable schedule
+    res_disable = await tool.execute(
+        action="schedule",
+        workflow_id="scheduled_flow",
+        enabled=False,
+    )
+    assert "Schedule disabled for workflow 'scheduled_flow'" in str(res_disable)
+    wf_disabled = service.get_workflow("scheduled_flow")
+    assert wf_disabled is not None and wf_disabled.trigger is not None
+    assert wf_disabled.trigger.enabled is False
+
+    # 5. Re-enable schedule
+    res_enable = await tool.execute(
+        action="schedule",
+        workflow_id="scheduled_flow",
+        enabled=True,
+    )
+    assert "Schedule enabled for workflow 'scheduled_flow'" in str(res_enable)
+    wf_enabled = service.get_workflow("scheduled_flow")
+    assert wf_enabled is not None and wf_enabled.trigger is not None
+    assert wf_enabled.trigger.enabled is True
+
+    # 6. Clear schedule
+    res_clear = await tool.execute(
+        action="schedule",
+        workflow_id="scheduled_flow",
+        clear=True,
+    )
+    assert "Schedule cleared for workflow 'scheduled_flow'" in str(res_clear)
+    wf_cleared = service.get_workflow("scheduled_flow")
+    assert wf_cleared is not None
+    assert wf_cleared.trigger is None
+
+

@@ -341,6 +341,16 @@ class WorkflowService:
             if self.cron_service is not None:
                 with suppress(Exception):
                     self.cron_service.remove_system_job(f"workflow:{workflow_id}")
+                    store = self.cron_service._require_store()
+                    store.jobs = [
+                        j
+                        for j in store.jobs
+                        if not (
+                            j.payload.kind == "workflow"
+                            and (j.payload.workflow_id == workflow_id or j.payload.message == workflow_id)
+                        )
+                    ]
+                    self.cron_service._save_store()
             return True
         return False
 

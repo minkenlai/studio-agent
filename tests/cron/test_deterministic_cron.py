@@ -999,6 +999,131 @@ async def test_run_bound_deterministic_skill_script_destination_routing_stdout_a
     assert "⚠️ Scheduled task 'skill-leads-dest' [stderr]:" in origin_msg.content
 
 
+def test_cron_tool_add_workflow_recurring_ssot(tmp_path: Path) -> None:
+    from nanobot.workflow.schema import WorkflowDefinition
+    from nanobot.workflow.service import WorkflowService
+
+    cron_service = CronService(tmp_path / "cron" / "jobs.json")
+    wf_service = WorkflowService(workflows_dir=tmp_path / "workflows", cron_service=cron_service)
+
+    # 1. Create a workflow
+    wf = WorkflowDefinition(
+        id="monitor_flow",
+        name="Monitor Flow",
+        start_at="done",
+        states={"done": {"type": "succeed"}},
+    )
+    wf_service.save_workflow(wf)
+    assert wf_service.get_workflow("monitor_flow") is not None
+
+    tool = CronTool(cron_service, default_timezone="UTC", workflow_service=wf_service)
+
+    # 2. Schedule workflow recurring via cron tool (SSOT facade)
+    with request_context(
+        RequestContext(channel="telegram", chat_id="123", session_key="telegram:123")
+    ):
+        result = asyncio.run(
+            tool.execute(
+                action="add",
+                workflow_id="monitor_flow",
+                cron_expr="*/15 * * * *",
+            )
+        )
+
+    assert "Workflow 'monitor_flow' recurring schedule set to '*/15 * * * *'" in result
+    assert "single source of truth (SSOT)" in result
+
+    # 3. Verify workflow definition's trigger was updated
+    saved_wf = wf_service.get_workflow("monitor_flow")
+    assert saved_wf is not None
+    assert saved_wf.trigger is not None
+    assert saved_wf.trigger.cron == "*/15 * * * *"
+    assert saved_wf.trigger.enabled is True
+
+    # 4. Verify system cron job is registered
+    jobs = cron_service.list_jobs()
+    system_job = next((j for j in jobs if j.id == "workflow:monitor_flow"), None)
+    assert system_job is not None
+    assert system_job.payload.kind == "workflow"
+    assert system_job.payload.workflow_id == "monitor_flow"
+
+    # 5. Verify list output
+    listing = tool._list_jobs()
+    assert "Workflow: monitor_flow (deterministic execution)" in listing
+
+    # 6. Remove via cron tool clears the trigger
+    remove_res = asyncio.run(tool.execute(action="remove", job_id="workflow:monitor_flow"))
+    assert "Removed schedule for workflow 'monitor_flow'" in remove_res
+    cleared_wf = wf_service.get_workflow("monitor_flow")
+    assert cleared_wf is not None
+    assert cleared_wf.trigger is None
+
+
+def test_cron_tool_add_workflow_one_shot(tmp_path: Path) -> None:
+    from nanobot.workflow.schema import WorkflowDefinition
+    from nanobot.workflow.service import WorkflowService
+
+    cron_service = CronService(tmp_path / "cron" / "jobs.json")
+    wf_service = WorkflowService(workflows_dir=tmp_path / "workflows", cron_service=cron_service)
+
+    wf = WorkflowDefinition(
+        id="oneshot_flow",
+        name="One-Shot Flow",
+        start_at="done",
+        states={"done": {"type": "succeed"}},
+    )
+    wf_service.save_workflow(wf)
+
+    tool = CronTool(cron_service, default_timezone="UTC", workflow_service=wf_service)
+
+    with request_context(
+        RequestContext(channel="telegram", chat_id="123", session_key="telegram:123")
+    ):
+        result = asyncio.run(
+            tool.execute(
+                action="add",
+                workflow_id="oneshot_flow",
+                at="2035-06-01T10:00:00",
+            )
+        )
+
+    assert "Scheduled one-shot deterministic run for workflow 'oneshot_flow'" in result
+    assert "delete automatically after run" in result
+
+    # One-shot does NOT alter the permanent definition trigger
+    saved_wf = wf_service.get_workflow("oneshot_flow")
+    assert saved_wf is not None
+    assert saved_wf.trigger is None
+
+    # Job is in cron store with delete_after_run
+    jobs = cron_service.list_jobs()
+    oneshot_job = next((j for j in jobs if j.payload.workflow_id == "oneshot_flow"), None)
+    assert oneshot_job is not None
+    assert oneshot_job.delete_after_run is True
+    assert oneshot_job.payload.kind == "workflow"
+
+
+def test_cron_tool_workflow_not_found(tmp_path: Path) -> None:
+    from nanobot.workflow.service import WorkflowService
+
+    cron_service = CronService(tmp_path / "cron" / "jobs.json")
+    wf_service = WorkflowService(workflows_dir=tmp_path / "workflows", cron_service=cron_service)
+    tool = CronTool(cron_service, default_timezone="UTC", workflow_service=wf_service)
+
+    with request_context(
+        RequestContext(channel="telegram", chat_id="123", session_key="telegram:123")
+    ):
+        result = asyncio.run(
+            tool.execute(
+                action="add",
+                workflow_id="nonexistent_flow",
+                cron_expr="0 9 * * *",
+            )
+        )
+    assert "Error: workflow 'nonexistent_flow' not found" in result
+
+
+
 
 
 

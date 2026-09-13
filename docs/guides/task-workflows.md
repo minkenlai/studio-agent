@@ -186,7 +186,30 @@ manage_workflow(
 
 # View recent execution runs
 manage_workflow(action="runs", workflow_id="quick-check")
+
+# Configure automated recurring schedule directly (SSOT)
+manage_workflow(action="schedule", workflow_id="quick-check", cron="*/15 * * * *", tz="America/Los_Angeles")
+
+# Disable or re-enable schedule without altering workflow definition
+manage_workflow(action="schedule", workflow_id="quick-check", enabled=False)
+manage_workflow(action="schedule", workflow_id="quick-check", enabled=True)
+
+# Clear schedule
+manage_workflow(action="schedule", workflow_id="quick-check", clear=True)
 ```
+
+### Scheduling Workflows Deterministically (No LLM Chat Noise)
+
+Workflows execute **deterministically in the background** without wrapping them in an LLM agent turn. Wrapping a workflow inside an agent turn prompt (e.g. `cron(action="add", message="Run workflow X")`) forces the LLM to wake up on every tick, run the workflow via tool call, and generate a chat message (like *"no activity"*), cluttering the chat.
+
+Instead, use native workflow scheduling:
+
+1. **Directly via `manage_workflow(action="schedule")`**:
+   Sets the canonical schedule in the workflow definition (`trigger: {"cron": "...", "tz": "...", "enabled": true}`) and immediately registers/synchronizes the system cron job.
+2. **Via `cron` Tool**:
+   - **Recurring (`cron_expr`)**: `cron(action="add", workflow_id="quick-check", cron_expr="0 9 * * 1-5")` acts as an SSOT facade that updates the workflow definition's `trigger` directly.
+   - **One-time (`at`)**: `cron(action="add", workflow_id="quick-check", at="2026-09-15T09:00:00")` schedules an ephemeral one-shot run that runs deterministically and auto-deletes upon completion without modifying the workflow definition.
+   - **Removal**: `cron(action="remove", job_id="workflow:quick-check")` removes the schedule and unregisters the job.
 
 ---
 

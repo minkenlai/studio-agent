@@ -8,8 +8,13 @@ from typing import Any, cast
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
-from nanobot.agent.tools.schema import ObjectSchema, StringSchema, tool_parameters_schema
-from nanobot.workflow.schema import WorkflowDefinition
+from nanobot.agent.tools.schema import (
+    BooleanSchema,
+    ObjectSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
+from nanobot.workflow.schema import TriggerConfig, WorkflowDefinition
 from nanobot.workflow.service import WorkflowService
 
 
@@ -18,14 +23,28 @@ from nanobot.workflow.service import WorkflowService
         action=StringSchema(
             "Action to perform: 'list' (list workflows), 'get' (view workflow definition), "
             "'save' (create or update workflow definition), 'delete' (remove workflow), "
-            "'run' (execute a workflow), 'runs' (view execution run logs), or 'validate' (check workflow validity)."
+            "'run' (execute a workflow), 'runs' (view execution run logs), 'validate' (check workflow validity), "
+            "or 'schedule' (configure automated recurring cron trigger for a workflow)."
         ),
         workflow_id=StringSchema(
-            "Unique workflow identifier (e.g. 'morning_triage'). Required for get, delete, and run."
+            "Unique workflow identifier (e.g. 'morning_triage'). Required for get, delete, run, and schedule."
+        ),
+        cron=StringSchema(
+            "Standard cron expression (e.g. '0 9 * * *' or '*/15 * * * *') for 'schedule' action."
+        ),
+        tz=StringSchema(
+            "Optional IANA timezone (e.g. 'UTC', 'America/Los_Angeles') for 'schedule' action."
+        ),
+        enabled=BooleanSchema(
+            description="Whether automated trigger schedule is enabled (defaults to true). Used with 'schedule' action."
+        ),
+        clear=BooleanSchema(
+            description="Optional flag for 'schedule' action. If true, removes the automated trigger schedule from the workflow."
         ),
         definition=ObjectSchema(
             description=(
                 "Workflow definition dictionary containing 'id', 'name', 'start_at', and 'states'.\n"
+                "Optional top-level fields: 'trigger' ({'cron': '*/15 * * * *', 'tz': 'UTC', 'enabled': true}), 'description'.\n"
                 "State types & output contracts:\n"
                 "1. 'exec' (or 'task' with action='exec'): Runs shell command. "
                 "Output shape: {'exit_code': int, 'stdout': str, 'stderr': str, 'json': object|null}. "
@@ -211,6 +230,47 @@ class ManageWorkflowTool(Tool):
                     msg += "\nWarnings:\n" + "\n".join(f"  ⚠️ {w}" for w in warnings_list)
                 return ToolResult.error(msg)
 
+        elif action == "schedule":
+            if not workflow_id:
+                return ToolResult.error("workflow_id is required for 'schedule' action.")
+            wf = self.service.get_workflow(workflow_id)
+            if wf is None:
+                return ToolResult.error(f"Workflow '{workflow_id}' not found.")
+            cron_expr = kwargs.get("cron") or kwargs.get("cron_expr")
+            tz_str = kwargs.get("tz")
+            enabled = kwargs.get("enabled", True)
+            clear = kwargs.get("clear", False)
+
+            if clear:
+                wf.trigger = None
+                self.service.save_workflow(wf)
+                return ToolResult(f"Schedule cleared for workflow '{workflow_id}'.")
+            if cron_expr is None and not enabled and wf.trigger:
+                wf.trigger.enabled = False
+                self.service.save_workflow(wf)
+                return ToolResult(f"Schedule disabled for workflow '{workflow_id}'.")
+            if not cron_expr and wf.trigger and enabled:
+                wf.trigger.enabled = True
+                self.service.save_workflow(wf)
+                return ToolResult(f"Schedule enabled for workflow '{workflow_id}' ({wf.trigger.cron}).")
+            if not cron_expr:
+                return ToolResult.error(
+                    "cron expression (e.g. '0 9 * * *' or '*/15 * * * *') is required for 'schedule' action."
+                )
+
+            wf.trigger = TriggerConfig(
+                cron=str(cron_expr),
+                tz=str(tz_str) if tz_str else None,
+                enabled=bool(enabled),
+            )
+            self.service.save_workflow(wf)
+            tz_msg = f" ({tz_str})" if tz_str else ""
+            status_msg = "enabled" if enabled else "disabled"
+            return ToolResult(
+                f"Workflow '{workflow_id}' recurring schedule set to '{cron_expr}'{tz_msg} ({status_msg}). "
+                "Synchronized with deterministic system cron."
+            )
+
         return ToolResult.error(
-            f"Unknown action: {action}. Use 'list', 'get', 'save', 'delete', 'run', 'runs', or 'validate'."
+            f"Unknown action: {action}. Use 'list', 'get', 'save', 'delete', 'run', 'runs', 'validate', or 'schedule'."
         )

@@ -9,11 +9,17 @@ Use the `cron` tool to schedule reminders or recurring tasks that should report 
 
 Do not use `cron` for periodic background checks that should stay quiet when there is nothing useful to report. For those, update `HEARTBEAT.md`; the protected heartbeat job runs those checks and only delivers results that pass the notification gate.
 
-## Three Modes
+## Modes
 
-1. **Reminder** - message is sent directly to user
-2. **Task** - message is a task description, agent executes and sends result
-3. **One-time** - runs once at a specific time, then auto-deletes
+1. **Reminder** - message is sent directly to user (`direct=True`)
+2. **Task (LLM Turn)** - message is a task description; agent executes turn each time and reports back
+3. **Deterministic Command** - `command` executes shell command without LLM; `quiet=True` silences empty output
+4. **Deterministic Skill Script** - `skill_name` + `script_name` executes script without LLM
+5. **Deterministic Workflow Execution** - `workflow_id` executes a state machine workflow directly without invoking an LLM conversational turn:
+   - **Recurring (`cron_expr`)**: Updates the workflow definition's `trigger` directly (single source of truth) and synchronizes with system cron.
+   - **One-time (`at`)**: Schedules an ephemeral run that automatically deletes after completion.
+   - **Zero Chat Noise**: The workflow executes silently in the background unless the workflow definition explicitly includes a `send_message` state. **NEVER use `message="Run workflow ..."` to schedule a workflow**, as that forces an unnecessary LLM conversation turn on every tick and creates chat spam.
+6. **One-time** - runs once at a specific ISO datetime (`at="<ISO datetime>"`), then auto-deletes
 
 ## Examples
 
@@ -30,6 +36,16 @@ cron(action="add", message="Check HKUDS/nanobot GitHub stars and report", every_
 Deterministic shell command (with quiet mode to only notify on non-empty output/error):
 ```
 cron(action="add", command="python scripts/check_health.py", every_seconds=300, quiet=True)
+```
+
+Deterministic workflow schedule (recurring SSOT):
+```
+cron(action="add", workflow_id="morning_triage", cron_expr="0 9 * * 1-5")
+```
+
+Deterministic workflow one-time run:
+```
+cron(action="add", workflow_id="db_backup", at="<ISO datetime>")
 ```
 
 Destination routing (route operational output to staff, error logs privately to admin):
